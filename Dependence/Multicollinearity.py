@@ -197,7 +197,7 @@ def regression(filtered_results,model,degree,test_size=0.2,n_jobs=-1,**model_par
         alpha = model_params.get('alpha',1.0)
         regression_model = Ridge(alpha = alpha)
 
-
+    # Create parallel tasks (number of combinations * length of terms in each combination, the later one is combo)
     tasks = []
     for combo_id, results in filtered_results.items():
         np.random.seed(27)
@@ -205,6 +205,7 @@ def regression(filtered_results,model,degree,test_size=0.2,n_jobs=-1,**model_par
         n_samples = results['matrix'].shape[0]
         n_train = int((1-test_size)*n_samples)
         # Use same random permutation for all regressions in this combination
+        # This procedure is aimed at selecting the best regression model for each combination
         perm = np.random.permutation(n_samples)
         train_idx = perm[:n_train]
         test_idx = perm[n_train:]
