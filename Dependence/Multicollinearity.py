@@ -167,7 +167,11 @@ def regression(filtered_results,model,degree,test_size=0.2,n_jobs=-1,fit_with_in
         regression_model = Lasso(alpha = alpha,fit_intercept=fit_with_intercept)
     elif model_lower == 'ridge':
         alpha = model_params.get('alpha',1.0)
+<<<<<<< HEAD
         regression_model = Ridge(alpha = alpha,fit_intercept=fit_with_intercept)
+=======
+        regression_model = Ridge(alpha = alpha)
+>>>>>>> 8ba5d9f10bd06f40c77641444315ab45ca89ab78
 
     # Create parallel tasks (number of combinations * length of terms in each combination, the later one is combo)
     tasks = []
