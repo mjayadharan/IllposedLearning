@@ -8,21 +8,6 @@ from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.base import clone
 from joblib import Parallel, delayed
 
-def single_combo_svd(data_vals,column_names,combo_indices):
-    cols = list(combo_indices)
-    combo_matrix = data_vals[:, cols]             
-    s = np.linalg.svd(combo_matrix, compute_uv=False)
-
-    return {
-        'terms'             : tuple(column_names[i] for i in cols),
-        'columns'           : tuple(column_names[i] for i in cols),
-        'matrix'            : combo_matrix,
-        'singular_values'   : s,
-        'min_singular_value': s[-1],
-        'max_singular_value': s[0],
-        'condition_number'  : s[0] / s[-1],
-    }
-
 
 def create_combinations_with_stable_svd(data, comb, preprocessing='standardize',n_jobs=-1,backend='loky'):
     """
@@ -37,10 +22,10 @@ def create_combinations_with_stable_svd(data, comb, preprocessing='standardize',
     preprocessing : str
         Preprocessing method for numerical stability
     
-    Returns:
-    --------
+    Returns
+    -------
     dict
-        Dictionary with combination results and SVD analysis
+        Dictionary with combination results including processed and original and SVD analysis
     """
     
     # Preprocess data for numerical stability
@@ -70,42 +55,34 @@ def create_combinations_with_stable_svd(data, comb, preprocessing='standardize',
         }
     
     # Parallel computation of SVD for each combination
-    data_vals = processed_data.values
-    combo_meta = Parallel(n_jobs=-1,backend=backend,prefer='processes')(
-        delayed(_single_combo_svd)(data_vals,column_names,combo)
+    data_vals_processed = processed_data.values
+    combo_meta_processed = Parallel(n_jobs=-1,backend=backend,prefer='processes')(
+        delayed(_single_combo_svd)(data_vals_processed,column_names,combo)
+        for combo in all_combinations
+    )
+    data_vals_original = data.values
+    combo_meta_original = Parallel(n_jobs=-1,backend=backend,prefer='processes')(
+        delayed(_single_combo_svd)(data_vals_original,column_names,combo)
         for combo in all_combinations
     )
 
-    combination_results = {}
-    for i,meta in enumerate(combo_meta):
-        combination_results[i] = {
+    combination_results_processed = {}
+    combination_results_original = {}
+    for i,meta in enumerate(combo_meta_processed):
+        combination_results_processed[i] = {
             **meta,
             'preprocessing_info':preproc_info
         }
+    for i,meta in enumerate(combo_meta_original):
+        combination_results_original[i] = {
+            **meta,
+            'preprocessing_info':'None'
+    }
     
-    return combination_results
+    return combination_results_processed,combination_results_original
 
 
-def singular_threshold(matrix,max_singular_value,eps=1e-12):
-    """
-    Define the threshold to determined whether the smallest singular value is smaller than 0
-
-    Def1:
-        Default threshold to detect rank deficiency in numpy.linalg.matrix_rank:
-            S.max() * max(M,N) * eps
-    
-    Def2:
-        S.max() * np.finfo(A.dtype).eps / 2. * np.sqrt(m + n + 1.)
-    """
-    # Expression for definition 1
-    M, N = np.shape(matrix)
-    threshold_1 = max_singular_value * max(M,N) * eps
-    # Expression for definition 2
-    threshold_2 = max_singular_value * np.finfo(matrix.dtype).eps / 2. * np.sqrt(M + N + 1.)
-    return threshold_1
-
-
-def filter_combinations(combination_results,threshold=20):
+def filter_combinations(combination_results_processed,combination_results_original,threshold=20):
     """
     Filter combinations with condition numbers larger than the threshold.
     
@@ -119,21 +96,19 @@ def filter_combinations(combination_results,threshold=20):
     dict
         Dictionary containing filtered combinations that meet the threshold criteria
     """
-    
     filtered_results = {}
     dropped_results = {}
-    for combo_id, result in combination_results.items():
-        condition_number = result['condition_number']
+    for combo_id, result_processed in combination_results_processed.items():
+        result_original = combination_results_original.get(combo_id)
+        condition_number = result_processed['condition_number']
         if condition_number > threshold:
-            result_copy = result.copy()
-            filtered_results[combo_id] = result_copy
+            filtered_results[combo_id] = result_original.copy()
         else:
-            result_copy = result.copy()
-            dropped_results[combo_id] = result.copy()
+            dropped_results[combo_id] = result_original.copy()
     return filtered_results, dropped_results
 
 
-def regression(filtered_results,model,degree,test_size=0.2,n_jobs=-1,**model_params):
+def regression(filtered_results,model,degree,test_size=0.2,n_jobs=-1,fit_with_intercept=False,**model_params):
     """
     Run regression(linear/Lasso/Ridge) for each combination and calculate R^2 and MSE.
 
@@ -143,6 +118,9 @@ def regression(filtered_results,model,degree,test_size=0.2,n_jobs=-1,**model_par
         Results from filter_combinations, which means terms in each combination are linearly dependent.
     model: Type of regression model('linear','lasso','ridge')
     degree: polynomial degree
+    fit_with_intercept: bool, default: False
+        Whether to include an intercept term in the regression models. 
+
     **model_params : dict
         Additional parameters for the regression model (e.g., alpha for Lasso/Ridge)
 
@@ -161,17 +139,11 @@ def regression(filtered_results,model,degree,test_size=0.2,n_jobs=-1,**model_par
         feat_names   = [column_names[i] for i in feat_idx]
         X_train,X_test      = full_matrix[train_idx][:, feat_idx],full_matrix[test_idx][:,  feat_idx]
         y_train,y_test      = full_matrix[train_idx,  target_idx],full_matrix[test_idx,   target_idx]
-        
-        if model_lower == 'linear':
-            coef,*_ =np.linalg.lstsq(X_train,y_train,rcond=None)
-            intercept = 0.0
-            y_pred = X_test @ coef
-        else:
-            mdl = clone(regression_model)
-            mdl.fit(X_train,y_train)
-            coef = mdl.coef_
-            intercept = mdl.intercept_
-            y_pred = mdl.predict(X_test)
+        mdl = clone(regression_model)
+        mdl.fit(X_train,y_train)
+        coef = mdl.coef_
+        intercept = mdl.intercept_
+        y_pred = mdl.predict(X_test)
         r2  = r2_score(y_test,  y_pred)
         mse = mean_squared_error(y_test, y_pred)
 
@@ -189,13 +161,13 @@ def regression(filtered_results,model,degree,test_size=0.2,n_jobs=-1,**model_par
     # Model selection : Linear / Lasso / Ridge
     model_lower = model.lower()
     if model_lower == 'linear':
-        regression_model = LinearRegression()
+        regression_model = LinearRegression(fit_intercept=fit_with_intercept)
     elif model_lower == 'lasso':
         alpha = model_params.get('alpha',1.0)
-        regression_model = Lasso(alpha = alpha)
+        regression_model = Lasso(alpha = alpha,fit_intercept=fit_with_intercept)
     elif model_lower == 'ridge':
         alpha = model_params.get('alpha',1.0)
-        regression_model = Ridge(alpha = alpha)
+        regression_model = Ridge(alpha = alpha,fit_intercept=fit_with_intercept)
 
     # Create parallel tasks (number of combinations * length of terms in each combination, the later one is combo)
     tasks = []
