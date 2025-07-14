@@ -10,6 +10,8 @@ from Multicollinearity import create_combinations_with_stable_svd,filter_combina
 from math import comb as n_choose_k
 from joblib import Parallel, delayed
 
+from Definitions import preprocess_for_stable
+
 import re
 
 def target_relationship(data,target_col,test_size=0.2,fit_with_intercept=False):
@@ -268,7 +270,7 @@ class Terms_Identification:
                 if term_cleaned:
                     all_terms.add(term_cleaned)
         self.all_original_terms = all_terms
-        self.all_xi_terms = all_terms
+        self.all_xi_terms = {t.replace('*',' ') for t in all_terms}
 
     def _strip_parameters(self, term: str) -> str:
         # Remove non-state-variable symbols (parameters) from the term, leaving only xi variables.
@@ -314,9 +316,6 @@ class Terms_Identification:
             pattern = r'\b' + re.escape(var_name) + r'\b'
             converted_term = re.sub(pattern, xi_var, converted_term)
         return converted_term
-    
-    def _parse_discovered_model(slef):
-        return
     
     def _extract_terms(self,equation):
         # Extract individual terms from an equation
@@ -476,3 +475,55 @@ class Terms_Identification:
         if re.search(r'\b[A-Za-z][A-Za-z0-9_]*\b', term):
             return False
         return True
+    
+class Terms_Analysis:
+    """
+    Input:
+        original_model: DataFrame
+        discovered_model: model form pysindy
+        data: candidate function library
+    """
+    def __init__(self,original_model,discovered_model,data):
+        self.original_model = original_model
+        self.discovered_model = self._sindy_model_to_df(discovered_model)
+        self.data = data
+
+        self.original = Terms_Identification(self.original_model)
+        self.discovered = Terms_Identification(self.discovered_model)
+        self.wrong_terms, self.missing_terms, self.Mixed_terms = self._wrong_missing_terms()
+        self.con = self._SVD_analysis()
+    @staticmethod
+    def _sindy_model_to_df(model):
+        # Convert a PySINDy model to a pandas DataFrame
+        equations = model.equations()
+        variables = model.feature_names
+        lhs_vars = [f"d{v}/dt" for v in variables]
+        # Fix spacing in RHS by inserting '*' between numbers and variables
+        fixed_equations = []
+        for eq in equations:
+            eq = re.sub(r'(?<=[0-9]) (?=[a-zA-Z])', '*', eq)     # e.g., '0.5 x1' → '0.5*x1'
+            eq = re.sub(r'(?<=[a-zA-Z0-9]) (?=[a-zA-Z])', '*', eq) # e.g., 'x1 x2' → 'x1*x2'
+            fixed_equations.append(eq)
+
+        dataframe = pd.DataFrame({
+            "Variable": lhs_vars,
+            "Equation": fixed_equations
+        })
+        return dataframe
+    
+    def _wrong_missing_terms(self):
+        self.original_terms = self.original._parse_model()[1]
+        self.discovered_terms = self.discovered._parse_model()[1]
+        wrong_terms = self.discovered_terms -  self.original_terms
+        missing_terms = self.original_terms - self.discovered_terms
+
+        all_terms = list(set(wrong_terms) | set(missing_terms))
+        Mixed_terms = self.data[all_terms]
+
+        return wrong_terms,missing_terms,Mixed_terms
+    
+    def _SVD_analysis(self):
+        X = preprocess_for_stable(self.Mixed_terms,'standardize')[0]
+        U, s, Vt = np.linalg.svd(X, full_matrices=False)
+        condition_number = s[0] / s[-1]
+        return condition_number
