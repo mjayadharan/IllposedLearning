@@ -10,6 +10,8 @@ from Multicollinearity import create_combinations_with_stable_svd,filter_combina
 from math import comb as n_choose_k
 from joblib import Parallel, delayed
 
+import re
+
 def target_relationship(data,target_col,test_size=0.2,fit_with_intercept=False):
     """
     Fit the relationship within target variables
@@ -123,7 +125,6 @@ class Noise_Free_results:
         self.comb_list = comb_list
         self._library_cahche = {}
         self.n_jobs = n_jobs
-        self.Num_library_terms,self.Num_comb,self.Num_ill_comb = self._Numbers()
         self.results = None
     
     def _generate_library(self,degree):
@@ -185,7 +186,7 @@ class Noise_Free_results:
         return summary[column_order]
 
 
-# ---------------------- New function for external noise-free analysis ----------------------
+# function for external noise-free analysis 
 def run_noise_free_analysis(data, degree_list, comb_list,n_jobs = None):
     """
     Wrapper function to run noise-free analysis externally.
@@ -216,3 +217,262 @@ def run_noise_free_analysis(data, degree_list, comb_list,n_jobs = None):
     return analyzer._run_analysis()
 
 
+class Terms_Identification:
+    def __init__(self,model_dataframe):
+        # model dataframe normally has two columns.
+        # The first column represents LHS of an equation, like dx/dt.
+        # The second column represents RHS of an equation, like k1*x1 + k1*k2*x3^2
+        self.original_model = model_dataframe
+
+        self.variable_mapping = {} # variables to xi
+        self.reverse_mapping = {} # xi to variables
+        self.original_equations = {}
+        self.all_original_terms = set()
+        self.all_xi_terms = set()
+    
+    def _parse_model(self):
+        # Create variables mapping
+        self._create_variable_mapping()
+        # Extract terms from all equations
+        self._extract_all_terms_from_equations()
+        # No need to call _convert_terms_to_xi here
+        return self.variable_mapping, self.all_xi_terms
+    
+    def _create_variable_mapping(self):
+        variable_order = []
+        for i in range(len(self.original_model)):
+            var_cell = self.original_model.iloc[i,0]
+            eq_cell = self.original_model.iloc[i,1]
+
+            if pd.notna(var_cell) and pd.notna(eq_cell):
+                var = str(var_cell).strip()
+                eq = str(eq_cell).strip()
+                if 'd' in var.lower() and 'dt' in var.lower():
+                    var_name = var.replace('/dt','').lstrip('d')
+                    variable_order.append(var_name)
+                    self.original_equations[var] = eq
+        for i,var_name in enumerate(variable_order):
+            xi_var = f"x{i+1}"
+            self.variable_mapping[xi_var] = var_name
+            self.reverse_mapping[var_name] = xi_var
+    
+    def _extract_all_terms_from_equations(self):
+        all_terms = set()
+        for var, equation in self.original_equations.items():
+            terms = self._extract_terms(equation)
+            for term in terms:
+                # Convert original variables to xi
+                term_xi = self._convert_single_term_to_xi(term)
+                # Remove parameters and retain terms only contain states,like x1*x2, x3^2
+                term_cleaned = self._strip_parameters(term_xi)
+                if term_cleaned:
+                    all_terms.add(term_cleaned)
+        self.all_original_terms = all_terms
+        self.all_xi_terms = all_terms
+
+    def _strip_parameters(self, term: str) -> str:
+        # Remove non-state-variable symbols (parameters) from the term, leaving only xi variables.
+        term = term.strip()
+        if not term:
+            return ''
+        factors = re.split(r'\*|\s', term)
+        xi_factors = []
+        xi_vars = self.reverse_mapping.values()
+        for f in factors:
+            for xi in xi_vars:
+                if f.startswith(xi):
+                    xi_factors.append(f)
+                    break
+        return '*'.join(sorted(xi_factors)) if xi_factors else ''
+
+    def _filter_variable_terms(self,terms):
+        # Filter terms contain state variables
+        filtered = set()
+        for term in terms:
+            contains_state_var = False
+            for var_name in self.reverse_mapping.keys():
+                if re.search(r'\b' + re.escape(var_name) + r'\b',term):
+                    contains_state_var = True
+                    break
+            if contains_state_var:
+                    filtered.add(term)
+        return filtered
+    
+    def _convert_terms_to_xi(self):
+        xi_terms = set()
+        for term in self.all_original_terms:
+            xi_term = self._convert_single_term_to_xi(term)
+            if xi_term:
+                xi_terms.add(xi_term)
+        self.all_xi_terms = xi_terms
+
+    def _convert_single_term_to_xi(self,term):
+        converted_term = term
+        sorted_vars = sorted(self.reverse_mapping.keys(),key=len,reverse=True)
+        for var_name in sorted_vars:
+            xi_var = self.reverse_mapping[var_name]
+            pattern = r'\b' + re.escape(var_name) + r'\b'
+            converted_term = re.sub(pattern, xi_var, converted_term)
+        return converted_term
+    
+    def _parse_discovered_model(slef):
+        return
+    
+    def _extract_terms(self,equation):
+        # Extract individual terms from an equation
+        equation = equation.replace(' ','')
+        # Expand the equation to prevent identifying (x+y) as a term
+        expanded_equation = self._expand_brackets(equation)
+        terms = self._split_equation_terms(expanded_equation)
+        # Remove coefficients and signs
+        cleaned_terms = set()
+        for term in terms:
+            original_term = term
+            term = term.strip()
+            while term.startswith('+') or term.startswith('-'):
+                term = term[1:]
+            term_no_coef = self._remove_coefficients(term)
+            is_constant = self._is_pure_constant(term_no_coef)
+            if term_no_coef and term_no_coef != '0' and not is_constant:
+                cleaned_terms.add(term)
+        
+        return cleaned_terms
+    
+    def _expand_brackets(self,equation):
+        # Expand brackets in the equation like 0.5*(x1+x2) -> 0.5*xx1+0.5*x2
+        while '(' in equation:
+            start = -1
+            for i,char in enumerate(equation):
+                if char == '(':
+                    start = i
+                elif char == ')' and start != -1:
+                    bracket_content = equation[start+1:i]
+
+                    coeff_start = start
+                    while coeff_start > 0 and (equation[coeff_start-1].isdigit() or equation[coeff_start-1] in '.*/'):
+                        coeff_start -= 1
+                    
+                    sign_start = coeff_start
+                    if coeff_start > 0 and equation[coeff_start-1] in '+-':
+                        sign_start = coeff_start - 1
+                    coefficient_part = equation[sign_start:start]
+                    expanded = self._expand_single_bracket(coefficient_part,bracket_content)
+                    equation = equation[:sign_start] + expanded + equation[i+1:]
+                    break
+                    
+        return equation
+    
+    def _expand_single_bracket(self,coefficient,bracket_content):
+        bracket_terms = self._split_equation_terms(bracket_content)
+        coeff = coefficient.strip()
+        if coeff.endswith('*'):
+            coeff = coeff[:-1]
+        coeff_sign = 1
+        coeff_value = ""
+        if not coeff or coeff == '+': 
+        # The real situation is coefficient value equals to 1 and the real term should looks like -x1
+            coeff_value = ""
+        elif coeff == '-':
+            coeff_sign = -1
+            coeff_value = ""
+        else:
+             if coeff.startswith('-'):
+                 coeff_sign = -1
+                 coeff_value = coeff[1:]
+             elif coeff.startswith('+'):
+                 coeff_value = coeff[1:]
+             else:
+                 coeff_value = coeff
+
+        expanded_terms = []
+        for term in bracket_terms:
+            term = term.strip()
+            term_sign = 1
+            if term.startswith('+'):
+                term = term[1:]
+            elif term.startswith('-'):
+                term_sign = -1
+                term = term[1:]
+            final_sign = coeff_sign * term_sign
+
+            # Build the expanded term
+            if coeff_value:
+                if final_sign == -1:
+                    expanded_term = '-' + coeff_value + '*' + term
+                else:
+                    expanded_term = coeff_value + '*' + term
+            else:
+                if final_sign == -1:
+                    expanded_term = '-' + term
+                else:
+                    expanded_term  = term
+            expanded_terms.append(expanded_term)
+        
+        # Join terms with proper signs
+        result = ''
+        for i,term in enumerate(expanded_terms):
+            if i == 0:
+                result = term
+            else:
+                if term.startswith('-'):
+                    result += term
+                else:
+                    result += '+' + term
+
+        return result
+    
+    def _split_equation_terms(self,equation:str):
+        # Split equation into without preserving signs.
+        terms = []
+        current_term = ""
+
+        i = 0
+        while i < len(equation):
+            char = equation[i]
+            if char == '+' or char == '-':
+                if current_term:
+                    terms.append(current_term)
+                if char == '-':
+                    current_term = '-'
+                else:
+                    current_term = ''
+            else:
+                current_term += char
+            i += 1
+        
+        if current_term:
+            terms.append(current_term)
+
+        return terms
+    
+    def _remove_coefficients(self, term: str) -> str:
+        #Remove symbolic or numeric coefficients from a term (e.g., 'k1*A' or '3*A' → 'A').
+        #Keeps only the parts of the term that include state variables (e.g., x1, x2, etc.).
+        term = term.strip()
+        if not term or term == '0':
+            return term
+        
+        coeff_pattern = r'^[+-]?\d*\.?\d*\*(.+)$'
+        match = re.match(coeff_pattern, term)
+        if match:
+            term = match.group(1)
+        
+        # If the entire term is just a number, return empty
+        if re.match(r'^[+-]?\d+\.?\d*$', term):
+            return ''
+        
+        return term
+    
+    def _is_pure_constant(self, term: str) -> bool:
+        #Return True if the term contains no system state variables (x1, x2, ...).
+        if not term or term.strip() == '':
+            return True
+        
+        # If term contains any xi variables, it's a variable term
+        if re.match(r'^[+-]?\d+\.?\d*$', term):
+            return True
+        
+        # If no xi variables found, it's a parameter/constant
+        if re.search(r'\b[A-Za-z][A-Za-z0-9_]*\b', term):
+            return False
+        return True
