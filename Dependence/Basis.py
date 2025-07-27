@@ -1,5 +1,5 @@
 import numpy as np
-from numpy.polynomial import Polynomial, chebyshev
+from numpy.polynomial import Polynomial, chebyshev, legendre
 import pandas as pd
 from dae_finder import PolyFeatureMatrix
 import Comparison
@@ -39,32 +39,41 @@ def normalization(data_states):
             data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
     return data_norm, L, U
 
-
-class Chebyshev:
-    def __init__(self,data,degree):
+ 
+class Orthogonal_Basis:
+    def __init__(self,data,degree,method):
         # data: DataFrame
         # original data including the time column, columns could haven't benn renamed
         # degree: specific single degree
         self.data = data
         self.degree = degree
+        self.method = method
 
-        data_std,time_col = Comparison.standardize_columns(data)
-        self.data_states = data_std.copy().drop(columns={time_col})
+        data_std,self.time_col = Comparison.standardize_columns(data)
+        self.data_states = data_std.copy().drop(columns={self.time_col})
         self.data_norm, self.L, self.U = normalization(self.data_states)
-        self.chebyshev_states, self.expr_states = self._single_library()
-        self.chebyshev_library = self._build_chebyshev_library()
+        self.val_states, self.expr_states = self._single_library()
+        self.library = self._build_function_library()
 
     def _single_library(self):
-        # Generate Chebyshev basis for each state
+        # Generate Orthogobal Basis for each state
+        # Return: val_states: dictionary (dateframe) 
+                            # basis for each state
+                # expr_states: dictionary (dataframe)
+                            # basis expression for each state
         states = self.data_norm.columns.tolist()
         expr_states = {}
-        chebyshev_val_states = {}
+        val_states = {}
         for s in states:
             df = pd.DataFrame()
             expr_str = {}
             x_vals = self.data_norm[s]
             for deg in range(self.degree+1):
-                T = chebyshev.Chebyshev.basis(deg,symbol=s)
+                if self.method == 'Chebyshev':
+                    T = chebyshev.Chebyshev.basis(deg,symbol=s)
+                else:
+                    T = legendre.Legendre.basis(deg,symbol=s)
+
                 P = T.convert(kind=Polynomial)
                 terms = []
                 for i,c in enumerate(P.coef):
@@ -81,10 +90,12 @@ class Chebyshev:
                 #expr_str[deg] = str(P).split('↦')[-1].strip()
                 df[f"T_{deg}({s})"] = T(x_vals)
             expr_states[s] = expr_str
-            chebyshev_val_states[s] = df
-        return chebyshev_val_states,expr_states
+            val_states[s] = df
+        return val_states,expr_states
     
-    def _build_chebyshev_library(self):
+    def _build_function_library(self):
+        # Generate basis library, column name interms of T_n(x1) and T_m(x2)
+        # This function could create cross terms and contain original terms with specific degrees
         states = self.data_states.columns.tolist()
         library_data = []  # Store (total_degree, symbolic_expr, val_series)
         
@@ -103,11 +114,14 @@ class Chebyshev:
             
             for i, deg in enumerate(deg_combo):
                 s = states[i]
-                val_series = val_series * self.chebyshev_states[s].iloc[:, deg]
+                val_series = val_series * self.val_states[s].iloc[:, deg]
                 
                 if deg > 0:
-                    # Get Chebyshev polynomial and convert to symbolic expression
-                    T = chebyshev.Chebyshev.basis(deg, symbol=s)
+                    if self.method == 'Chebyshev':
+                        # Get Chebyshev polynomial and convert to symbolic expression
+                        T = chebyshev.Chebyshev.basis(deg, symbol=s)
+                    else:
+                        T = legendre.Legendre.basis(deg,symbol=s)
                     P = T.convert(kind=Polynomial)
                     
                     # Build symbolic polynomial
@@ -136,10 +150,11 @@ class Chebyshev:
         library_expr = [item[2] for item in library_data]
         library_vals = [item[3] for item in library_data]
         
-        chebyshev_library = pd.DataFrame(dict(zip(library_expr, library_vals)))
-        return chebyshev_library
+        library = pd.DataFrame(dict(zip(library_expr, library_vals)))
+        return library
 
     def _format_polynomial(self,expr,sym_vars):
+        # Convert T_n(x1) * T_m(x2) into a polynomial in terms of x1 and x2
         expr = sp.expand(expr)
         # Convert to string with proper ordering
         terms = []
@@ -163,14 +178,14 @@ class Chebyshev:
                             var_parts.append(str(var))
                         elif power > 1:
                             var_parts.append(f"{var}^{power}")
-                var_str = "*".join(var_parts)
+                var_str = " ".join(var_parts)
 
                 if coef == 1:
                     terms.append(var_str)
                 elif coef == -1:
                     terms.append(f"-{var_str}")
                 else:
-                    terms.append(f"{coef}*{var_str}")
+                    terms.append(f"{coef} {var_str}")
         # Join terms with proper signs
         if not terms:
             return "0"
