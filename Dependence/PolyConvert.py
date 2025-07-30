@@ -418,7 +418,6 @@ class EquationDenormalizer:
             if var in str(expr):
                 if self.U[var] != self.L[var]:
                     norm_in_terms_of_orig = (self.orig_vars[var] + 1)*(self.U[var] - self.L[var])/2 + self.L[var]
-                    #norm_in_terms_of_orig = 2*(self.orig_vars[var] - self.L[var])/(self.U[var] - self.L[var]) - 1
                     substitutions[sp.Symbol(var)] = norm_in_terms_of_orig
                 else:
                     substitutions[sp.Symbol(var)] = 0
