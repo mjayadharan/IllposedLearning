@@ -1,11 +1,18 @@
 import numpy as np
-from numpy.polynomial import Polynomial, chebyshev, legendre
-import pandas as pd
 from dae_finder import PolyFeatureMatrix
 import Comparison
-from itertools import product
-import sympy as sp
+
+from numpy.polynomial import Polynomial, legendre
+from typing import Iterator, Tuple
+from numpy.typing import NDArray
+from scipy import sparse
+from sklearn.utils.validation import check_is_fitted
+
 import pysindy as ps
+from pysindy.utils import AxesArray
+from pysindy.utils import comprehend_axes
+from pysindy.feature_library.base import BaseFeatureLibrary
+from pysindy.feature_library.base import x_sequence_or_item
 
 class Monomials:
     def __init__(self,data,degree):
@@ -39,317 +46,15 @@ def normalization(data_states):
         else:
             data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
     return data_norm, L, U
-
-
-#class Orthogonal_Basis:
-    def __init__(self,data,degree,method):
-        # data: DataFrame
-        # original data including the time column, columns could haven't benn renamed
-        # degree: specific single degree
-        self.data = data
-        self.degree = degree
-        self.method = method
-
-        data_std,self.time_col = Comparison.standardize_columns(data)
-        self.data_states = data_std.copy().drop(columns={self.time_col})
-        self.data_norm, self.L, self.U = normalization(self.data_states)
-        self.val_states, self.expr_states = self._single_library()
-        self.library = self._build_function_library()
-
-    def _single_library(self):
-        # Generate Orthogobal Basis for each state
-        # Return: val_states: dictionary (dateframe) 
-                            # basis for each state
-                # expr_states: dictionary (dataframe)
-                            # basis expression for each state
-        states = self.data_norm.columns.tolist()
-        expr_states = {}
-        val_states = {}
-        for s in states:
-            df = pd.DataFrame()
-            expr_str = {}
-            x_vals = self.data_norm[s]
-            for deg in range(self.degree+1):
-                if self.method == 'Chebyshev':
-                    T = chebyshev.Chebyshev.basis(deg,symbol=s)
-                else:
-                    T = legendre.Legendre.basis(deg,symbol=s)
-
-                P = T.convert(kind=Polynomial)
-                terms = []
-                for i,c in enumerate(P.coef):
-                    if abs(c) > 1e-12:
-                        if i == 0:
-                            terms.append(f'{c:.1f}')
-                        elif i == 1:
-                            terms.append(f'{"+ " if c > 0 else "- "} {abs(c):.1f} {s}')                        
-                        else:
-                            terms.append(f'{"+ " if c > 0 else "- "} {abs(c):.1f} {s}^{i}')
-                expr_str[deg] = terms[0]
-                for t in terms[1:]:
-                    expr_str[deg] += f'{t}'
-                #expr_str[deg] = str(P).split('↦')[-1].strip()
-                df[f"T_{deg}({s})"] = T(x_vals)
-            expr_states[s] = expr_str
-            val_states[s] = df
-        return val_states,expr_states
-    
-    def _build_function_library(self):
-        # Generate basis library, column name interms of T_n(x1) and T_m(x2)
-        # This function could create cross terms and contain original terms with specific degrees
-        states = self.data_states.columns.tolist()
-        library_data = []  # Store (total_degree, symbolic_expr, val_series)
-        
-        # Create symbolic variables
-        sym_vars = {s: sp.Symbol(s) for s in states}
-        
-        for deg_combo in product(range(self.degree+1), repeat=len(states)):
-            total_deg = sum(deg_combo)
-            if total_deg == 0 or total_deg > self.degree:
-                continue
-            
-            # Build symbolic expression
-            symbolic_expr = 1
-            #symbolic_expr = sp.Integer(1)
-            val_series = pd.Series(1.0, index=self.data_states.index)
-            
-            for i, deg in enumerate(deg_combo):
-                s = states[i]
-                val_series = val_series * self.val_states[s].iloc[:, deg]
-                
-                if deg > 0:
-                    if self.method == 'Chebyshev':
-                        # Get Chebyshev polynomial and convert to symbolic expression
-                        T = chebyshev.Chebyshev.basis(deg, symbol=s)
-                    else:
-                        T = legendre.Legendre.basis(deg,symbol=s)
-                    P = T.convert(kind=Polynomial)
-                    
-                    # Build symbolic polynomial
-                    poly_expr = 0
-                    for j, coef in enumerate(P.coef):
-                        if abs(coef) > 1e-12:
-                            if abs(coef - round(coef)) < 1e-10:
-                                coef = int(round(coef))
-                            else:
-                                coef = round(coef,6)
-                            poly_expr += coef * sym_vars[s]**j
-                    
-                    symbolic_expr *= poly_expr
-            
-            # Expand and simplify the expression
-            symbolic_expr = sp.expand(symbolic_expr)
-            # Convert to string with proper formatting
-            term_name = self._format_polynomial(symbolic_expr, sym_vars)
-            
-            library_data.append((total_deg, deg_combo, term_name, val_series))
-        
-        # Sort by total degree and then by degree combination
-        library_data.sort(key=lambda x: (x[0],) + x[1])
-        
-        # Extract sorted names and values
-        library_expr = [item[2] for item in library_data]
-        library_vals = [item[3] for item in library_data]
-        
-        library = pd.DataFrame(dict(zip(library_expr, library_vals)))
-        return library
-
-    def _format_polynomial(self,expr,sym_vars):
-        # Convert T_n(x1) * T_m(x2) into a polynomial in terms of x1 and x2
-        expr = sp.expand(expr)
-        # Convert to string with proper ordering
-        terms = []
-        expr_dict = expr.as_coefficients_dict()
-        # Sort terms by total degree (descending) and then by variables
-        sorted_terms = sorted(expr_dict.items(),
-                              key=lambda x: (sum(x[0].as_powers_dict().values()), str(x[0])),
-                              reverse=True)
-        for term, coef in sorted_terms:
-            if term == 1:
-                terms.append(f"{coef}")
-            else:
-                # Format variables and powers
-                var_parts = []
-                powers = term.as_powers_dict()
-                # Sort variables for consistent ordering
-                for var in sorted(powers.keys(),key=str):
-                    if var in sym_vars.values():
-                        power = powers[var]
-                        if power == 1:
-                            var_parts.append(str(var))
-                        elif power > 1:
-                            var_parts.append(f"{var}^{power}")
-                var_str = " ".join(var_parts)
-
-                if coef == 1:
-                    terms.append(var_str)
-                elif coef == -1:
-                    terms.append(f"-{var_str}")
-                else:
-                    terms.append(f"{coef} {var_str}")
-        # Join terms with proper signs
-        if not terms:
-            return "0"
-        result = terms[0]
-        for term in terms[1:]:
-            if term.startswith("-"):
-                result += f"{term}"
-            else:
-                result += f"+ {term}"
-        return result
     
 
-#class Orthogonal_Basis:
-    def __init__(self,data,degree,method):
-        self.data = data
-        self.degree = degree
-        self.method = method
-        
-        data_std,self.time_col = Comparison.standardize_columns(data)
-        self.data_states = data_std.copy().drop(columns={self.time_col})
-        self.data_norm, self.L, self.U = self._normalization()
-        self.library_functions, self.library_function_names = self._build_orthogonal_func()
-        #self.val_states, self.expr_states = self._single_library()
-        #self.library = self._build_function_library()
-    
-    def _normalization(self):
-        # data_states: DataFrame, only has state columns
-        data_norm = self.data_states.copy()
-        L,U = {},{}
-        for col in data_norm.columns:
-            Li = self.data_states[col].min()
-            Ui = self.data_states[col].max()
-            L[col] = Li
-            U[col] = Ui
-            if Li == Ui:
-                data_norm[col] = 0
-                print("Warning: All values are equal")
-            else:
-                data_norm[col] = 2*(self.data_states[col]-Li)/(Ui-Li)-1
-        return data_norm, L, U
-    
-    #def _build_orthogonal_func(self):
-        states = self.data_states.columns.tolist()
-        library_functions = []
-        library_function_names = []
-        for deg_combo in product(range(self.degree+1),repeat=len(states)):
-            total_deg = sum(deg_combo)
-            if total_deg == 0 or total_deg > self.degree:
-                continue
-
-            poly_list = []
-            name_parts = []
-            for i, deg in enumerate(deg_combo):
-                s = states[i]
-                if self.method == 'Chebyshev':
-                    T = chebyshev.Chebyshev.basis(deg)
-                    E = T.convert(kind=Polynomial)
-                elif self.method == 'Legendre':
-                    P = legendre.Legendre.basis(deg)
-                    E = P.convert(kind=Polynomial)
-                else:
-                    raise ValueError("Basis currently unavailable")
-                
-                poly_list.append((i, E))
-                # Create name for this term
-                if self.method == 'Chebyshev':
-                    name_parts.append(f"T_{deg}({s})")
-                elif self.method == 'Legendre':
-                    name_parts.append(f"P_{deg}({s})")
-
-            if poly_list:
-                library_functions.append(self._make_interaction_function(poly_list))
-                function_name = " * ".join(name_parts)
-                library_function_names.append(function_name)
-
-            return library_functions, library_function_names
-
-    def _build_orthogonal_func(self):
-        library_functions = []
-        library_function_names = []
-        for deg in range(self.degree+1):
-            if self.method == 'Chebyshev':
-                T = chebyshev.Chebyshev.basis(deg)
-                E = T.convert(kind=Polynomial)
-                library_functions.append(self._make_poly_function(E))
-                expr_str = str(E).split('↦')[-1].strip()
-                library_function_names.append(expr_str)
-            elif self.method == 'Legendre':
-                P = legendre.Legendre.basis(deg)
-                E = P.convert(kind=Polynomial)
-                library_functions.append(self._make_poly_function(E))
-                expr_str = str(E).split('↦')[-1].strip()
-                library_function_names.append(expr_str)
-
-        return library_functions, library_function_names
-    
-    def _make_poly_function(self, poly):
-        """Create a function that properly handles AxesArray inputs"""
-        def poly_func(x):
-            # Convert AxesArray to regular numpy array if needed
-            if hasattr(x, 'array'):
-                x_array = x.array
-            else:
-                x_array = np.asarray(x)
-            return poly(x_array)
-        return poly_func
-    
-    #def _make_interaction_function(self, poly_list):
-        """Create a function that evaluates the product of multiple polynomials on different variables"""
-        def interaction_func(x):
-            # Convert AxesArray to regular numpy array if needed
-            if hasattr(x, 'array'):
-                x_array = x.array
-            else:
-                x_array = np.asarray(x)
-            
-            # Start with ones
-            result = np.ones(x_array.shape[0])
-            
-            # Multiply by each polynomial evaluated on its corresponding column
-            for col_idx, poly in poly_list:
-                poly_values = poly(x_array[:, col_idx])
-                result *= poly_values
-            
-            return result
-        
-        return interaction_func
-    
-    def _get_pysindy_library(self):
-        return ps.CustomLibrary(
-            library_functions = self.library_functions,
-            function_names = [lambda x, name=name: name for name in self.library_function_names],
-            interaction_only = False
-            #function_names = self.library_function_names
-        )
-    
-    
-from typing import Iterator, Tuple
-import numpy as np
-from numpy.typing import NDArray
-from scipy import sparse
-from sklearn.utils.validation import check_is_fitted
-import warnings
-
-# 导入pysindy的必要组件
-import pysindy as ps
-from pysindy.utils import AxesArray
-from pysindy.utils import comprehend_axes
-from pysindy.utils import wrap_axes
-from pysindy.feature_library.base import BaseFeatureLibrary
-from pysindy.feature_library.base import x_sequence_or_item
-
-
-class ChebyshevLibrary(BaseFeatureLibrary):
+class OrthogonalLibrary(BaseFeatureLibrary):
     """Generate Chebyshev polynomial features.
-
     This library generates features using Chebyshev polynomials of the first kind.
-    Chebyshev polynomials are orthogonal polynomials that are particularly useful
-    for approximation and numerical analysis.
 
     Parameters
     ----------
-    degree : integer, optional (default 2)
+    degree : integer, default 2
         The maximum degree of the Chebyshev polynomial features.
 
     include_interaction : boolean, optional (default True)
@@ -379,12 +84,14 @@ class ChebyshevLibrary(BaseFeatureLibrary):
 
     def __init__(
         self,
-        degree=2,
+        degree,
+        method,
         include_interaction=True,
         interaction_only=False,
-        include_bias=True,
+        include_bias=False,
     ):
         super().__init__()
+        self.method = method
         self.degree = degree
         self.include_interaction = include_interaction
         self.interaction_only = interaction_only
@@ -424,6 +131,15 @@ class ChebyshevLibrary(BaseFeatureLibrary):
                 T_prev = T_curr
             
             return T_prev
+    
+    def _legendre_polynomial(self,x: np.ndarray, n: int) -> np.ndarray:
+        """
+        Compute the n-th Legendre polynomial P_n(x).
+        """
+        T = legendre.Legendre.basis(self.degree)
+        P = T.convert(kind=Polynomial)
+
+        return P(x)
 
     @staticmethod
     def _combinations(
@@ -531,9 +247,15 @@ class ChebyshevLibrary(BaseFeatureLibrary):
             for feat_idx, degree in enumerate(row):
                 if degree > 0:
                     if degree == 1:
-                        terms.append(f"T_1({input_features[feat_idx]})")
+                        if self.method == 'Chebyshev':
+                            terms.append(f"T_1({input_features[feat_idx]})")
+                        elif self.method == 'Legendre':
+                            terms.append(f"P_1({input_features[feat_idx]})")
                     else:
-                        terms.append(f"T_{degree}({input_features[feat_idx]})")
+                        if self.method == 'Chebyshev':
+                            terms.append(f"T_{degree}({input_features[feat_idx]})")
+                        elif self.method == 'Legendre':
+                            terms.append(f"P_{degree}({input_features[feat_idx]})")
             
             if len(terms) == 0:
                 name = "1"  # Constant term (T_0)
@@ -645,8 +367,12 @@ class ChebyshevLibrary(BaseFeatureLibrary):
                             idx[coord_axis] = feat_idx
                             feature_data = x[tuple(idx)]
                         
-                        chebyshev_val = self._chebyshev_polynomial(feature_data, degree)
-                        result = result * chebyshev_val
+                        if self.method == 'Chebyshev':
+                            chebyshev_val = self._chebyshev_polynomial(feature_data, degree)
+                            result = result * chebyshev_val
+                        elif self.method == 'Legendre':
+                            legendre_val = self._legendre_polynomial(feature_data, degree)
+                            result = result * legendre_val
                 
                 # Put the results into the output array
                 if coord_axis == -1:
@@ -660,7 +386,7 @@ class ChebyshevLibrary(BaseFeatureLibrary):
         
         return xp_full
 
-def n_chebyshev_features(
+def n_features(
     n_in_feat: int,
     degree: int,
     include_bias: bool = False,
@@ -680,8 +406,8 @@ def n_chebyshev_features(
         raise ValueError("Cannot set interaction only if include_interaction is False")
     
     # Use the combinations generator to count features
-    combinations = list(ChebyshevLibrary._combinations(
-        n_in_feat, degree, include_interaction, interaction_only, include_bias
+    combinations = list(OrthogonalLibrary._combinations(
+    n_in_feat, degree, include_interaction, interaction_only, include_bias
     ))
     return len(combinations)
 
@@ -691,6 +417,7 @@ def IdentityChebyshevLibrary():
     Generate an identity library using Chebyshev polynomials which maps all 
     input features to themselves. This is equivalent to T_1(x_i) for each feature.
     """
-    return ChebyshevLibrary(degree=1, include_bias=False)
+    return OrthogonalLibrary(degree=1, method='Chebyshev',include_bias=False)
 
-
+def IdentityLegendreLibrary():
+    return OrthogonalLibrary(degree=1, method='Legendre',include_bias=False)
