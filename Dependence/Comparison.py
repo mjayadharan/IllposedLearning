@@ -7,6 +7,7 @@ from scipy.interpolate import UnivariateSpline
 
 from dae_finder import PolyFeatureMatrix,sequentialThLin
 import pysindy as ps
+from Basis import OrthogonalLibrary
 from Multicollinearity import create_combinations_with_stable_svd,filter_combinations
 from math import comb as n_choose_k
 from joblib import Parallel, delayed
@@ -139,22 +140,65 @@ def compute_time_derivatives(data:pd.DataFrame,time_col:str,method:str,order=1,*
 class Noise_Free_results:
     """Compare different results without anthropogenic noise"""
 
-    def __init__(self,data,degree_list,comb_list,time_col,n_jobs=-1):
+    def __init__(self,data,degree_list,comb_list,method='Monomial',n_jobs=-1):
         self.data = data
         self.degree_list = degree_list
         self.comb_list = comb_list
-        self.time_col = time_col
+        self.method = method
         self._library_cahche = {}
         self.n_jobs = n_jobs
         self.results = None
-    
-    def _generate_library(self,degree):
-        data_states = self.data.drop(columns=self.time_col)
 
-        poly_feature_ob = PolyFeatureMatrix(degree)
-        candidate_lib = poly_feature_ob.fit_transform(data_states)
-        candidate_lib = candidate_lib.drop(["1"], axis=1)
-        
+        self.data_norm = self.normalization()
+    
+    def normalization(self):
+        # data_states: DataFrame, only has state columns
+        data_std,self.time_col = standardize_columns(self.data)
+        data_states = data_std.drop(columns=self.time_col)
+        data_norm = data_states.copy()
+        L,U = {},{}
+        for col in data_norm.columns:
+            Li = data_states[col].min()
+            Ui = data_states[col].max()
+            L[col] = Li
+            U[col] = Ui
+            if Li == Ui:
+                data_norm[col] = 0
+                print("Warning: All values are equal")
+            else:
+                data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
+        return data_norm
+
+    def _generate_library(self,degree):
+        include_interaction_flag = (degree > 1)
+        if self.method == 'Monomial':
+            data_states = self.data.drop(columns=self.time_col)
+
+            poly_feature_ob = PolyFeatureMatrix(degree)
+            candidate_lib = poly_feature_ob.fit_transform(data_states)
+            candidate_lib = candidate_lib.drop(["1"], axis=1)
+        elif self.method == 'Chebyshev':
+            library = OrthogonalLibrary(
+                degree=degree,
+                method='Chebyshev',
+                include_bias=False,
+                include_interaction=include_interaction_flag
+            )
+            # Always pass input_feature_names=self.data.columns to preserve order/names
+            library.fit(self.data_norm,)
+            candidate_lib = library.transform_to_dataframe(self.data_norm, 
+                                                           input_feature_names=self.data_norm.columns)
+        elif self.method == 'Legendre':
+            library = OrthogonalLibrary(
+                degree=degree,
+                method='Legendre',
+                include_bias=False,
+                include_interaction=include_interaction_flag
+            )
+            library.fit(self.data_norm)
+            candidate_lib = library.transform_to_dataframe(self.data_norm, 
+                                                           input_feature_names=self.data_norm.columns)
+
         return candidate_lib
     
     def _process_single_combination(self,degree,comb):
@@ -205,9 +249,7 @@ class Noise_Free_results:
 
         return summary[column_order]
 
-
-# function for external noise-free analysis 
-def run_noise_free_analysis(data, degree_list, comb_list,n_jobs = None):
+def run_noise_free_analysis(data, degree_list, comb_list, method, n_jobs = None):
     """
     Wrapper function to run noise-free analysis externally.
 
@@ -228,7 +270,7 @@ def run_noise_free_analysis(data, degree_list, comb_list,n_jobs = None):
         - Num_ill_comb : dict
     """
     print(">>> Running noise-free analysis...")
-    analyzer = Noise_Free_results(data, degree_list, comb_list,n_jobs)
+    analyzer = Noise_Free_results(data, degree_list, comb_list, method, n_jobs)
     
     print(">>> Generating candidate libraries...")
     print(f"    Degrees: {degree_list}")
