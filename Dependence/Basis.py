@@ -3,7 +3,7 @@ import pandas as pd
 from dae_finder import PolyFeatureMatrix
 import Comparison
 
-from numpy.polynomial import Polynomial, legendre
+from numpy.polynomial import Polynomial, chebyshev, legendre
 from typing import Iterator, Tuple
 from numpy.typing import NDArray
 from scipy import sparse
@@ -23,7 +23,8 @@ class Monomials:
         self.data = data
         self.degree = degree
         # data_states only has state columns and has been renamed
-        self.data_states = Comparison.standardize_columns(data)
+        data_std,self.time_col = Comparison.standardize_columns(self.data)
+        self.data_states = data_std.drop(columns=self.time_col)
     
     def _generate_library(self):
         poly_feature_ob = PolyFeatureMatrix(self.degree)
@@ -118,26 +119,30 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         T_1(x) = x
         T_n(x) = 2x * T_{n-1}(x) - T_{n-2}(x)
         """
-        if n == 0:
-            return np.ones_like(x)
-        elif n == 1:
-            return x
-        else:
-            T_prev_prev = np.ones_like(x)  # T_0
-            T_prev = x                      # T_1
+        #if n == 0:
+            #return np.ones_like(x)
+        #elif n == 1:
+            #return x
+        #else:
+            #T_prev_prev = np.ones_like(x)  # T_0
+            #T_prev = x                      # T_1
             
-            for i in range(2, n + 1):
-                T_curr = 2 * x * T_prev - T_prev_prev
-                T_prev_prev = T_prev
-                T_prev = T_curr
+            #for i in range(2, n + 1):
+                #T_curr = 2 * x * T_prev - T_prev_prev
+                #T_prev_prev = T_prev
+                #T_prev = T_curr
             
-            return T_prev
+            #return T_prev
+        T_1 = chebyshev.Chebyshev.basis(n)
+        T = T_1.convert(kind=Polynomial)
+
+        return T(x)
     
     def _legendre_polynomial(self,x: np.ndarray, n: int) -> np.ndarray:
         """
         Compute the n-th Legendre polynomial P_n(x).
         """
-        T = legendre.Legendre.basis(self.degree)
+        T = legendre.Legendre.basis(n)
         P = T.convert(kind=Polynomial)
 
         return P(x)
@@ -238,9 +243,9 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         output_feature_names : list of string, length n_output_features
         """
         check_is_fitted(self)
-        powers = self.powers_
+        powers = np.array(sorted(self.powers_, key=lambda row: (np.sum(row), tuple(row))))
         if input_features is None:
-            input_features = ["x%d" % i for i in range(powers.shape[1])]
+            input_features = ["x%d" % i+1 for i in range(powers.shape[1])]
         
         feature_names = []
         for row in powers:
