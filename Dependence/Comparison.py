@@ -512,7 +512,7 @@ class Terms_Identification_original:
     def _expand_brackets(self,equation):
         equation = equation.replace(' ','')
         equation = self._protect_function_parentheses(equation)
-        # Expand brackets in the equation like 0.5*(x1+x2) -> 0.5*xx1+0.5*x2
+        # Expand brackets in the equation like 0.5*(x1+x2) -> 0.5*x1+0.5*x2
         while '(' in equation:
             start = -1
             for i,char in enumerate(equation):
