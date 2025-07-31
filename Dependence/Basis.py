@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from dae_finder import PolyFeatureMatrix
 import Comparison
 
@@ -385,6 +386,29 @@ class OrthogonalLibrary(BaseFeatureLibrary):
             xp_full.append(xp)
         
         return xp_full
+    
+    def transform_to_dataframe(self, x: np.ndarray, input_feature_names: list[str] = None):
+        """
+        Transform the input array to a pandas DataFrame where each column is a basis function.
+        
+        Parameters
+        ----------
+        x : np.ndarray of shape (n_samples, n_features)
+            Input data to be transformed.
+        
+        input_feature_names : list of str
+            Names for the input features
+        
+        Returns
+        -------
+        df : pandas.DataFrame
+            A DataFrame where each column corresponds to a basis function and rows to samples.
+        """
+        check_is_fitted(self)
+        x_transformed = self.transform([x])[0]  # Transform expects a list of arrays
+        feature_names = self.get_feature_names(input_feature_names)
+        return pd.DataFrame(x_transformed, columns=feature_names)
+
 
 def n_features(
     n_in_feat: int,
