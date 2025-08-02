@@ -149,7 +149,7 @@ class Noise_Free_results:
         self.n_jobs = n_jobs
         self.results = None
 
-        self.data_norm = self.normalization()
+        self.data_norm, self.data_states = self.normalization()
     
     def normalization(self):
         # data_states: DataFrame, only has state columns
@@ -167,15 +167,13 @@ class Noise_Free_results:
                 print("Warning: All values are equal")
             else:
                 data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
-        return data_norm
+        return data_norm,data_states
 
     def _generate_library(self,degree):
         include_interaction_flag = (degree > 1)
         if self.method == 'Monomial':
-            data_states = self.data.drop(columns=self.time_col)
-
             poly_feature_ob = PolyFeatureMatrix(degree)
-            candidate_lib = poly_feature_ob.fit_transform(data_states)
+            candidate_lib = poly_feature_ob.fit_transform(self.data_states)
             candidate_lib = candidate_lib.drop(["1"], axis=1)
         elif self.method == 'Chebyshev':
             library = OrthogonalLibrary(
@@ -185,9 +183,9 @@ class Noise_Free_results:
                 include_interaction=include_interaction_flag
             )
             # Always pass input_feature_names=self.data.columns to preserve order/names
-            library.fit(self.data_norm,)
-            candidate_lib = library.transform_to_dataframe(self.data_norm, 
-                                                           input_feature_names=self.data_norm.columns)
+            library.fit(self.data_states,)
+            candidate_lib = library.transform_to_dataframe(self.data_states, 
+                                                           input_feature_names=self.data_states.columns)
         elif self.method == 'Legendre':
             library = OrthogonalLibrary(
                 degree=degree,
@@ -195,9 +193,9 @@ class Noise_Free_results:
                 include_bias=False,
                 include_interaction=include_interaction_flag
             )
-            library.fit(self.data_norm)
-            candidate_lib = library.transform_to_dataframe(self.data_norm, 
-                                                           input_feature_names=self.data_norm.columns)
+            library.fit(self.data_states)
+            candidate_lib = library.transform_to_dataframe(self.data_states, 
+                                                           input_feature_names=self.data_states.columns)
 
         return candidate_lib
     
