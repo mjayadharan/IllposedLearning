@@ -6,9 +6,64 @@ from scipy.stats import qmc
 from scipy.stats import chisquare
 from scipy.spatial.distance import pdist, squareform
 from scipy import stats
+from pathlib import Path
+from joblib import Parallel, delayed
+import matplotlib.pyplot as plt
 
-from Comparison import standardize_columns
+from Comparison import standardize_columns, run_noise_free_analysis
 from Basis import normalization
+
+
+# Helper for parallel analysis
+def _process_combo(data, distribution, sbml_path, num, n_step, start, end, degree_list, comb_list, method, out_dir_str):
+    """Worker: run one (num, n_step) combo and return summary dict."""
+    # Ensure directory exists in worker
+    os.makedirs(out_dir_str, exist_ok=True)
+
+    # Build sampler and simulate
+    Sample = sampling(data, int(num), distribution=distribution)
+    filepaths = Sample.fit_and_save(sbml_path, out_dir_str, start, end, int(n_step))
+
+    # Subsample
+    subsample = Sample._subsample(filepaths)
+
+    # Resolve time column robustly: prefer 'time' from simulation outputs
+    available_cols = subsample.columns
+    if 'time' in available_cols:
+        _time_cols = ['time']
+    else:
+        # fall back to Sample.time_col if present in subsample
+        if isinstance(Sample.time_col, (list, tuple)):
+            _time_cols = [c for c in Sample.time_col if c in available_cols]
+        else:
+            _time_cols = [Sample.time_col] if Sample.time_col in available_cols else []
+
+    state_cols = list(_time_cols) + list(Sample.ID)
+    subsample_states = subsample[state_cols]
+
+    # Analysis according to distribution/method
+    dist_lower = distribution.lower()
+    if dist_lower == 'uniform':
+        if method in ('Monomial', 'Legendre'):
+            summary_result = run_noise_free_analysis(subsample_states, degree_list, comb_list, method)
+        else:
+            raise ValueError("Cannot assign basis for this distribution, try another distribution")
+    elif dist_lower == 'arcsine':
+        if method == 'Chebyshev':
+            summary_result = run_noise_free_analysis(subsample_states, degree_list, comb_list, method)
+        else:
+            raise ValueError("Cannot assign basis for this distribution, try another distribution")
+    else:
+        raise ValueError(f"Unknown distribution: {distribution}")
+
+    return {
+        'num': int(num),
+        'start': float(start),
+        'end': float(end),
+        'n_step': int(n_step),
+        'summary': summary_result,
+        'method': method,
+    }
 
 def sobol_u01(num,d,seed=0):
     # Sobol seeds (with random shift) and FPS
@@ -107,12 +162,14 @@ class create_initial_conditions:
         """
 
 
-class sampling():
+class sampling:
     """
     This class is used for sampling under different initial conditions and finally deriving the time series 
     distributed as a specific distribution.
     """
     def __init__(self,data,num,distribution='uniform'):
+        # num: how many initial conditions are expected to be generated
+        # n_step: how many steps are expected to simulated
         self.data = data
         self.num = num
         self.distribution = distribution
@@ -120,9 +177,10 @@ class sampling():
         Creator = create_initial_conditions(self.data,self.num,self.distribution)
         self.sample_orig = Creator.sample_orig
         self.data_states = Creator.data_states
+        self.time_col = Creator.time_col
         self.state_cols = self.data_states.columns.tolist()
     
-    def fit_and_save(self,sbml_path:str,out_path:str,start,end,n_points,
+    def fit_and_save(self,sbml_path:str,out_path:str,start,end,n_step,
                      filename_prefix="IC"):
         os.makedirs(out_path,exist_ok=True)
         rr = te.loadSBMLModel(sbml_path)
@@ -151,7 +209,7 @@ class sampling():
                     rr[f'init({s})'] = v
 
             rr.reset()
-            res = rr.simulate(start, end, n_points)
+            res = rr.simulate(start, end, n_step)
             df = pd.DataFrame(res, columns=rr.timeCourseSelections)
 
             rates_list = []
@@ -273,7 +331,7 @@ class sampling():
         return result
     
 
-class distribution_test():
+class distribution_test:
     def __init__(self,sample):
         self.sample = sample
         self.X = self.sample.to_numpy()
@@ -628,3 +686,346 @@ class distribution_test():
             'note': f"{note_bounds}; permutations={int(n_perm)}; pooled={n_new+m_new}/{n+m}"
         }
 
+
+class Trend_IC_time:
+    def __init__(self,data,num_list,distribution,sbml_path,start_list,end_list,time_interval,n_steps_list,
+                 degree_list, comb_list, method):
+        self.data = data
+        self.num_list = num_list
+        self.distribution = distribution
+        self.sbml_path = sbml_path
+        self.start_list = start_list
+        self.end_list = end_list
+        self.time_interval = time_interval
+        self.n_steps_list = n_steps_list
+        self.degree_list = degree_list
+        self.comb_list = comb_list
+        self.method = method
+
+        #self.results = self._analysis_summary()
+        self.results = self._analysis_summary_parallel()
+        # Build wide tables for ill-posed counts per degree (2-comb and 3-comb)
+        self.ill2_table, self.ill3_table = self._modify_pattern(degree_start=1, fill=None, keep_max_col=True)
+
+    def _analysis_summary(self):
+        results = []
+        base_dir = Path(self.sbml_path).parent
+
+        # helper to fetch start/end given index in n_steps_list
+        def _get_start_end(idx):
+            # start
+            if len(self.start_list) == len(self.n_steps_list):
+                start = self.start_list[idx]
+            elif len(self.start_list) == 1:
+                start = self.start_list[0]
+            else:
+                raise ValueError("start_list length must be 1 or match n_steps_list length")
+            # end
+            if len(self.end_list) == len(self.n_steps_list):
+                end = self.end_list[idx]
+            elif len(self.end_list) == 1:
+                end = self.end_list[0]
+            else:
+                raise ValueError("end_list length must be 1 or match n_steps_list length")
+            return start, end
+
+        # iterate over all combinations of num and n_step
+        for num in self.num_list:
+            for idx, n_step in enumerate(self.n_steps_list):
+                start, end = _get_start_end(idx)
+
+                out_path = base_dir / f"IC_{self.distribution}_n{int(num)}_pts{int(n_step)}"
+                out_path.mkdir(parents=True, exist_ok=True)
+
+                Sample = sampling(self.data, int(num), distribution=self.distribution)
+                filepaths = Sample.fit_and_save(self.sbml_path, str(out_path), start, end, int(n_step))
+
+                subsample = Sample._subsample(filepaths)
+
+                # Resolve time column robustly: prefer 'time' produced by simulate()
+                available_cols = subsample.columns
+                if 'time' in available_cols:
+                    _time_cols = ['time']
+                else:
+                    if isinstance(Sample.time_col, (list, tuple)):
+                        _time_cols = [c for c in Sample.time_col if c in available_cols]
+                    else:
+                        _time_cols = [Sample.time_col] if Sample.time_col in available_cols else []
+
+                state_cols = list(_time_cols) + list(Sample.ID)
+                subsample_states = subsample[state_cols]
+
+                if self.distribution.lower() == 'uniform':
+                    if self.method in ('Monomial', 'Legendre'):
+                        summary_result = run_noise_free_analysis(subsample_states, self.degree_list, self.comb_list, self.method)
+                    else:
+                        raise ValueError("Cannot assign basis for this distribution, try another distribution")
+                elif self.distribution.lower() == 'arcsine':
+                    if self.method == 'Chebyshev':
+                        summary_result = run_noise_free_analysis(subsample_states, self.degree_list, self.comb_list, self.method)
+                    else:
+                        raise ValueError("Cannot assign basis for this distribution, try another distribution")
+                else:
+                    raise ValueError(f"Unknown distribution: {self.distribution}")
+
+                results.append({
+                    'num': int(num),
+                    'start': float(start),
+                    'end': float(end),
+                    'n_step': int(n_step),
+                    'summary': summary_result,
+                    'method': self.method
+                })
+        return results
+    
+    def _modify_pattern(self, degree_start: int = 1, fill=None, keep_max_col: bool = False):
+        """
+        Convert per-(num, n_step) summary DataFrames into wide tables.
+
+        Returns
+        -------
+        ill2_table : pd.DataFrame
+            Columns: ['num', 'n_step', 'deg1_ill2', 'deg2_ill2', ..., 'ill2_at_max_degree']
+        ill3_table : pd.DataFrame or None
+            Same shape for 3-combination column if present; otherwise None.
+        """
+        rows_2 = []
+        rows_3 = []
+
+        # Determine the global set of degrees across all summaries (>= degree_start)
+        all_degrees = set()
+        for res in self.results:
+            df = res['summary']
+            if isinstance(df, pd.DataFrame) and 'degree' in df.columns:
+                degs = df.loc[df['degree'] >= degree_start, 'degree'].astype(int).tolist()
+                all_degrees.update(degs)
+        if not all_degrees:
+            return pd.DataFrame(columns=['num', 'n_step']), None
+        degrees_sorted = sorted(int(d) for d in all_degrees)
+
+        for res in self.results:
+            num = int(res['num'])
+            n_step = int(res['n_step'])
+            df = res['summary']
+            if not isinstance(df, pd.DataFrame) or 'degree' not in df.columns:
+                # Skip malformed entries
+                continue
+
+            # Safe accessors for the two target columns
+            has_ill2 = ('# ill-posed 2comb' in df.columns)
+            has_ill3 = ('# ill-posed 3comb' in df.columns)
+
+            sub = df.loc[df['degree'] >= degree_start].copy()
+            if sub.empty:
+                # Construct empty rows with NaNs (or fill)
+                base_row = {'num': num, 'n_step': n_step}
+                for d in degrees_sorted:
+                    base_row[f'deg{d}_ill2'] = fill
+                if keep_max_col:
+                    base_row['ill2_at_max_degree'] = fill
+                rows_2.append(base_row)
+                if has_ill3:
+                    base_row3 = {'num': num, 'n_step': n_step}
+                    for d in degrees_sorted:
+                        base_row3[f'deg{d}_ill3'] = fill
+                    if keep_max_col:
+                        base_row3['ill3_at_max_degree'] = fill
+                    rows_3.append(base_row3)
+                continue
+
+            sub['degree'] = sub['degree'].astype(int)
+            s2 = sub.set_index('degree')[['# ill-posed 2comb']].iloc[:, 0] if has_ill2 else pd.Series(dtype=float)
+            s3 = sub.set_index('degree')[['# ill-posed 3comb']].iloc[:, 0] if has_ill3 else pd.Series(dtype=float)
+
+            # Row for ill-posed 2-comb
+            row2 = {'num': num, 'n_step': n_step}
+            for d in degrees_sorted:
+                val = s2.get(d)
+                row2[f'deg{d}_ill2'] = (float(val) if pd.notna(val) else fill)
+            if keep_max_col:
+                row2['ill2_at_max_degree'] = (float(s2.iloc[-1]) if len(s2) > 0 and pd.notna(s2.iloc[-1]) else fill)
+            rows_2.append(row2)
+
+            # Row for ill-posed 3-comb (optional)
+            if has_ill3:
+                row3 = {'num': num, 'n_step': n_step}
+                for d in degrees_sorted:
+                    val = s3.get(d)
+                    row3[f'deg{d}_ill3'] = (float(val) if pd.notna(val) else fill)
+                if keep_max_col:
+                    row3['ill3_at_max_degree'] = (float(s3.iloc[-1]) if len(s3) > 0 and pd.notna(s3.iloc[-1]) else fill)
+                rows_3.append(row3)
+
+        ill2_table = pd.DataFrame(rows_2).sort_values(['num', 'n_step']).reset_index(drop=True)
+        ill3_table = (pd.DataFrame(rows_3).sort_values(['num', 'n_step']).reset_index(drop=True)
+                      if rows_3 else None)
+
+        return ill2_table, ill3_table
+
+    def plot_illposed_tables(self, which='both'):
+        """
+        Plot ill-posed counts versus n_step and num for both comb-number tables.
+        In Jupyter, figures will be displayed (no saving).
+
+        Parameters
+        ----------
+        which : {'both','ill2','ill3'}
+            Which tables to plot. 'both' will attempt ill2 then ill3 if available.
+        """
+        def _degree_cols(tbl, comb_tag):
+            if tbl is None or tbl.empty:
+                return []
+            cols = []
+            for c in tbl.columns:
+                if c.startswith('deg') and c.endswith(f'_{comb_tag}'):
+                    cols.append(c)
+            def _degnum(name):
+                try:
+                    return int(name.split('_')[0][3:])  # 'deg3_ill2' -> 3
+                except Exception:
+                    return 10**9
+            cols.sort(key=_degnum)
+            return cols
+
+        def _subplot_grid(n):
+            import math
+            r = int(math.ceil(math.sqrt(max(1, n))))
+            c = int(math.ceil(n / r))
+            return r, c
+
+        def _color_map_for_degrees(deg_cols):
+            # Build a stable color mapping across subplots
+            import itertools
+            prop_cycle = plt.rcParams['axes.prop_cycle']
+            colors = list(prop_cycle.by_key().get('color', ['C0','C1','C2','C3','C4','C5','C6','C7','C8','C9']))
+            # repeat if not enough
+            col_cycle = list(itertools.islice(itertools.cycle(colors), len(deg_cols)))
+            return {dc: col_cycle[i] for i, dc in enumerate(deg_cols)}
+
+        def _marker_map_for_degrees(deg_cols):
+            import itertools
+            markers = ['o', 's', '^', 'D', 'v', 'P', '*', 'X', 'h', '>', '<', 'H', '8', 'p']
+            mk_cycle = list(itertools.islice(itertools.cycle(markers), len(deg_cols)))
+            return {dc: mk_cycle[i] for i, dc in enumerate(deg_cols)}
+
+        def _plot_case_fix_num(tbl, comb_tag):
+            if tbl is None or tbl.empty:
+                return None
+            deg_cols = _degree_cols(tbl, comb_tag)
+            if not deg_cols:
+                return None
+            color_map = _color_map_for_degrees(deg_cols)
+            marker_map = _marker_map_for_degrees(deg_cols)
+            nums = sorted(tbl['num'].unique())
+            r, c = _subplot_grid(len(nums))
+            fig, axes = plt.subplots(r, c, figsize=(4.5*c, 3.5*r), squeeze=False, sharex=False, sharey=False)
+            for i, num in enumerate(nums):
+                ax = axes[i//c][i%c]
+                sub = tbl[tbl['num'] == num].sort_values('n_step')
+                x = sub['n_step'].values
+                for dc in deg_cols:
+                    y = sub[dc].values
+                    ax.plot(x, y, marker=marker_map[dc], label=dc.split('_')[0], color=color_map[dc])
+                ax.set_title(f"num={num}")
+                ax.set_xlabel('n_step')
+                ax.set_ylabel(f"# ill-posed ({comb_tag})")
+                ax.grid(alpha=0.3)
+                ax.legend(fontsize=8)
+            # hide unused axes
+            total = r*c
+            for j in range(len(nums), total):
+                axes[j//c][j%c].axis('off')
+            plt.tight_layout()
+            plt.show()
+            return fig
+
+        def _plot_case_fix_nstep(tbl, comb_tag):
+            if tbl is None or tbl.empty:
+                return None
+            deg_cols = _degree_cols(tbl, comb_tag)
+            if not deg_cols:
+                return None
+            color_map = _color_map_for_degrees(deg_cols)
+            marker_map = _marker_map_for_degrees(deg_cols)
+            steps = sorted(tbl['n_step'].unique())
+            r, c = _subplot_grid(len(steps))
+            fig, axes = plt.subplots(r, c, figsize=(4.5*c, 3.5*r), squeeze=False, sharex=False, sharey=False)
+            for i, ns in enumerate(steps):
+                ax = axes[i//c][i%c]
+                sub = tbl[tbl['n_step'] == ns].sort_values('num')
+                x = sub['num'].values
+                for dc in deg_cols:
+                    y = sub[dc].values
+                    ax.plot(x, y, marker=marker_map[dc], label=dc.split('_')[0], color=color_map[dc])
+                ax.set_title(f"n_step={ns}")
+                ax.set_xlabel('num (initial_conditions)')
+                ax.set_ylabel(f"# ill-posed ({comb_tag})")
+                ax.grid(alpha=0.3)
+                ax.legend(fontsize=8)
+            # hide unused axes
+            total = r*c
+            for j in range(len(steps), total):
+                axes[j//c][j%c].axis('off')
+            plt.tight_layout()
+            plt.show()
+            return fig
+
+        to_plot = []
+        if which in ('both','ill2'):
+            to_plot.append(('ill2', self.ill2_table))
+        if which in ('both','ill3'):
+            to_plot.append(('ill3', self.ill3_table))
+
+        figs = {}
+        for comb_tag, table in to_plot:
+            figs[(comb_tag,'fix-num')] = _plot_case_fix_num(table, comb_tag)
+            figs[(comb_tag,'fix-nstep')] = _plot_case_fix_nstep(table, comb_tag)
+        return figs
+
+    def _analysis_summary_parallel(self, n_jobs=-1, backend='loky'):
+        base_dir = Path(self.sbml_path).parent
+
+        def _get_start_end(idx):
+            if len(self.start_list) == len(self.n_steps_list):
+                start = self.start_list[idx]
+            elif len(self.start_list) == 1:
+                start = self.start_list[0]
+            else:
+                raise ValueError("start_list length must be 1 or match n_steps_list length")
+            if len(self.end_list) == len(self.n_steps_list):
+                end = self.end_list[idx]
+            elif len(self.end_list) == 1:
+                end = self.end_list[0]
+            else:
+                raise ValueError("end_list length must be 1 or match n_steps_list length")
+            return start, end
+
+        tasks = []
+        for num in self.num_list:
+            for idx, n_step in enumerate(self.n_steps_list):
+                start, end = _get_start_end(idx)
+                out_path = base_dir / f"IC_{self.distribution}_n{int(num)}_pts{int(n_step)}"
+                tasks.append((num, n_step, start, end, str(out_path)))
+
+        # Parallel execution
+        results = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes')(
+            [
+                delayed(_process_combo)(
+                    self.data,
+                    self.distribution,
+                    self.sbml_path,
+                    num,
+                    n_step,
+                    start,
+                    end,
+                    self.degree_list,
+                    self.comb_list,
+                    self.method,
+                    out_dir_str,
+                ) for (num, n_step, start, end, out_dir_str) in tasks
+            ]
+        )
+
+        self.results = results
+        self.ill2_table, self.ill3_table = self._modify_pattern(degree_start=1, fill=None, keep_max_col=True)
+        return self.results
