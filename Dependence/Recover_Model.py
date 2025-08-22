@@ -6,7 +6,7 @@ from sklearn.metrics import mean_squared_error
 from matplotlib.ticker import LogFormatterExponent
 
 from dae_finder import sequentialThLin
-from Comparison import standardize_columns
+from Comparison import standardize_columns, TimeSeriesDerivative
 from Basis import OrthogonalLibrary, normalization
 from PolyConvert import ChebyshevToPolynomialConverter, EquationDenormalizer
 import pysindy as ps
@@ -73,45 +73,66 @@ class Recover_Model_dae:
 
 
 class Recover_Model_sindy:
-    def __init__(self,data,differential_order,poly_degree,threshold,threshold_scan,method='Monomial'):
+    def __init__(self,data,differential_order,poly_degree,threshold,Xdot=None,method='Monomial'):
         # data: DataFrame -- contains all columns including states and time
         # method: basis library used, the default one is monomial library
         self.data = data
         self.differential_order = differential_order
         self.poly_degree = poly_degree
         self.threshold = threshold
-        self.threshold_scan = threshold_scan
+        self.Xdot = Xdot
         self.method = method
 
-        self.data_states,self.time = self._preprocess()
+        self.data_states, self.time = self._preprocess()
+
         if method == 'Monomial':
             self.model_expression = self._recovered_model_monomial()
         else:
             self.model_expression = self._recovered_model_orthogonal()
-    
+
     def _preprocess(self):
         data, time_col = standardize_columns(self.data)
-        time = data[time_col].to_numpy()
+        if isinstance(time_col, list):
+            self.time_col_name = time_col[0]
+        else:
+            time_col_name = time_col
+        time = data[time_col_name].to_numpy()
         data_states = data.copy().drop(columns={time_col})
+
         self.features = data_states.columns.tolist()
         if self.method == 'Chebyshev' or self.method == 'Legendre':
             self.data_norm, self.L, self.U = normalization(data_states)
         return data_states, time
     
     def _recovered_model_monomial(self):
-        differential_method = ps.FiniteDifference(self.differential_order)
+        #differential_method = ps.FiniteDifference(self.differential_order)
         feature_library = ps.PolynomialLibrary(self.poly_degree,include_bias=False)
         optimizer = ps.STLSQ(threshold=self.threshold)
         feature_names = self.features
 
-        model = ps.SINDy(
-            differentiation_method=differential_method,
-            feature_library = feature_library,
-            optimizer = optimizer,
-            feature_names = feature_names
-        )
-        self.model = model
-        model.fit(self.data_states,t = self.time)
+        X = np.array(self.data_states, dtype=np.float64)
+        t = np.array(self.time, dtype=np.float64).reshape(-1)
+        dt = t[1] - t[0]
+        
+        if self.Xdot is None:
+            X_dot = np.gradient(X,t,axis=0,edge_order=self.differential_order)
+            model = ps.SINDy(
+                #differentiation_method=differential_method,
+                feature_library = feature_library,
+                optimizer = optimizer,
+                feature_names = feature_names
+            )
+            self.model = model
+            model.fit(X,t=t,x_dot=X_dot)
+            #model.fit(self.data_states,t = self.time)
+        else:
+            model = ps.SINDy(
+                feature_library=feature_library,
+                optimizer=optimizer,
+                feature_names=feature_names
+            )
+            self.model = model
+            model.fit(self.data_states,t=t,x_dot=self.Xdot)
         eq_list = model.equations()
 
         states, rhs_raw = [], []
