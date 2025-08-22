@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+import math
+if not hasattr(np, 'math'):
+    np.math = math
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error
@@ -19,7 +22,7 @@ import re
 def standardize_columns(df,time_col=None):
     # Convert variables to x1,x2,x3,...
     if time_col is None:
-        candidate_names = {"t_Exp","t_fine"}
+        candidate_names = {"t_Exp","t_fine","time"}
         found = [c for c in df.columns if c in candidate_names]
         if not found:
             raise ValueError("Uable to auto-detect time column. Need provide 'time_col'")
@@ -185,7 +188,9 @@ class Noise_Free_results:
             # Always pass input_feature_names=self.data.columns to preserve order/names
             library.fit(self.data_states,)
             candidate_lib = library.transform_to_dataframe(self.data_states, 
-                                                           input_feature_names=self.data_states.columns)
+                                                           #input_feature_names=self.data_states.columns)
+            #candidate_lib = library.transform_to_dataframe(self.data_norm, 
+                                                           input_feature_names=self.data_norm.columns)   
         elif self.method == 'Legendre':
             library = OrthogonalLibrary(
                 degree=degree,
@@ -194,6 +199,8 @@ class Noise_Free_results:
                 include_interaction=include_interaction_flag
             )
             library.fit(self.data_states)
+            #candidate_lib = library.transform_to_dataframe(self.data_norm, 
+            #                                               input_feature_names=self.data_norm.columns)
             candidate_lib = library.transform_to_dataframe(self.data_states, 
                                                            input_feature_names=self.data_states.columns)
 
@@ -347,8 +354,12 @@ class Recover_Model_sindy:
     
     def _preprocess(self):
         data,time_col = standardize_columns(self.data)
-        time = data[time_col].to_numpy()
-        data_states = data.copy().drop(columns={time_col})
+        if isinstance(time_col, list):
+            time_col_name = time_col[0]
+        else:
+            time_col_name = time_col
+        time = data[time_col_name].to_numpy()
+        data_states = data.copy().drop(columns=time_col)
         self.features = data_states.columns.tolist()
         return data_states, time
     
