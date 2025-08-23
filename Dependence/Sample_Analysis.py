@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 
 from Comparison import standardize_columns, run_noise_free_analysis
 from Basis import normalization
+from Base_test import Lotka_Volterra, CRN
 
 
 # Helper for parallel analysis
@@ -225,6 +226,132 @@ class sampling:
             fp = os.path.join(out_path, f"{filename_prefix}_{k:03d}.xlsx")
             data_augmented.to_excel(fp, index=False)
             filepaths.append(fp)
+
+        return filepaths
+    
+    def fit_and_save_base(self, model_name: str, out_path, start, end, n_step,
+                          filename_prefix="IC", **model_kwargs):
+        """
+        Simulate and save trajectories for models implemented in Base_test
+        (i.e., not SBML-based). The output schema matches `fit_and_save`:
+        one Excel file per initial condition with columns [time, states, d(state)/dt].
+
+        Parameters
+        ----------
+        model_name : str
+            Currently supports 'Lotka-Volterra','Chemical Reaction Network'
+        **model_kwargs :
+            Extra parameters required by a given model. 
+            For Lotka-Volterra:
+              - params: dict with keys {alpha, beta, gamma, delta}
+              - noise_level: float or None
+              - state_names: list[str] giving the model's internal state names
+                (default ["x","y"]).
+            For Chemical Reaction Network:
+              - k_rates: dict with keys {k,kr,kcat}
+              - noise_level: float or None
+              - state_names: list[str] giving the model's internal state names
+                (default ["S","E","ES","P"]).
+        """
+        os.makedirs(out_path, exist_ok=True)
+
+        # Use the standardized names coming from create_initial_conditions, e.g. ['x1','x2', ...]
+        std_names = list(self.sample_orig.columns)
+        self.ID = std_names  # downstream methods rely on this
+
+        # Time grid
+        t_eval = np.linspace(float(start), float(end), int(n_step))
+        t_span = (float(start), float(end))
+
+        filepaths = []
+
+        if model_name.lower() == 'lotka-volterra':
+            # Map standardized names (x1,x2,...) to the Base_test internal names (x,y)
+            model_state_names = model_kwargs.get('state_names', ["x", "y"])  # order matters
+            if len(model_state_names) != 2:
+                raise ValueError("Lotka-Volterra expects exactly 2 model state names.")
+            if len(std_names) < 2:
+                raise ValueError("Lotka-Volterra requires at least two standardized state columns (e.g., x1,x2).")
+
+            # Build a consistent mapping between model names and standardized names, in order
+            model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
+            std_in_model_order = [model_to_std[m] for m in model_state_names]  # e.g. ['x1','x2']
+
+            params = model_kwargs.get('params')
+            if params is None:
+                raise ValueError("'params' must be provided for Lotka-Volterra in model_kwargs.")
+            noise_level = model_kwargs.get('noise_level', None)
+
+            for k in range(len(self.sample_orig)):
+                row = self.sample_orig.iloc[k]
+                # Initial condition in the model's variable order (x,y)
+                z0= [float(row[s]) for s in std_in_model_order]
+
+                # Simulate via the Base_test class
+                lv = Lotka_Volterra(params=params, t_span=t_span, t_eval=t_eval, z0=z0, noise_level=noise_level)
+                df_raw = lv.data_sim.copy()  # columns: ['time','x','y']
+
+                # Rename model outputs (x,y) -> standardized names (x1,x2) for consistency with the rest of the pipeline
+                rename_map = {m: model_to_std[m] for m in model_state_names}
+                df = df_raw.rename(columns=rename_map)
+
+                # Compute derivative at each time using the model RHS, feeding values in (x,y) order
+                deriv = []
+                for i in range(len(df)):
+                    t = float(df.loc[i, 'time']) if 'time' in df.columns else float(t_eval[i])
+                    # Values in model order
+                    state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
+                    dstate = lv.lv_rhs(t, state_vec_model_order)
+                    deriv.append(dstate)
+                deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
+
+                data_augmented = pd.concat([df, deriv_df], axis=1)
+                fp = os.path.join(out_path, f"{filename_prefix}_{k:03d}.xlsx")
+                data_augmented.to_excel(fp, index=False)
+                filepaths.append(fp)
+
+        elif model_name.lower() == 'crn':
+            model_state_names = model_kwargs.get('state_names', ["S","E","ES","P"])
+
+            # Build a consistent mapping between model names and standardized names, in order
+            model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
+            std_in_model_order = [model_to_std[m] for m in model_state_names]  # e.g. ['x1','x2','x3','x4']
+
+            k_rates = model_kwargs.get('k_rates')
+            if k_rates is None:
+                raise ValueError("'k_rates' must be provided for Chemical Reaction Network in model_kwargs.")
+            noise_level = model_kwargs.get('noise_level', None)
+
+            for k in range(len(self.sample_orig)):
+                row = self.sample_orig.iloc[k]
+                # Initial condition in the model's variable order (x,y)
+                init_cond = [float(row[s]) for s in std_in_model_order]
+
+                # Simulate via the Base_test class
+                crn = CRN(k_rates=k_rates, init_cond=init_cond, solvedT=t_eval, noise_level=noise_level)
+                df_raw = crn.data_sim.copy()  # columns: ['time','x','y']
+
+                # Rename model outputs (x,y) -> standardized names (x1,x2) for consistency with the rest of the pipeline
+                rename_map = {m: model_to_std[m] for m in model_state_names}
+                df = df_raw.rename(columns=rename_map)
+
+                # Compute derivative at each time using the model RHS, feeding values in (x,y) order
+                deriv = []
+                for i in range(len(df)):
+                    t = float(df.loc[i, 'time']) if 'time' in df.columns else float(t_eval[i])
+                    # Values in model order
+                    state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
+                    dstate = crn.toyEnzRHS(state_vec_model_order, t)
+                    deriv.append(dstate)
+                deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
+
+                data_augmented = pd.concat([df, deriv_df], axis=1)
+                fp = os.path.join(out_path, f"{filename_prefix}_{k:03d}.xlsx")
+                data_augmented.to_excel(fp, index=False)
+                filepaths.append(fp)
+        
+        else:
+            raise ValueError(f"Unsupported base model: {model_name}")
 
         return filepaths
     
