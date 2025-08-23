@@ -73,13 +73,14 @@ class Recover_Model_dae:
 
 
 class Recover_Model_sindy:
-    def __init__(self,data,differential_order,poly_degree,threshold,Xdot=None,method='Monomial'):
+    def __init__(self,data,differential_order,poly_degree,threshold,threshold_scan=None,Xdot=None,method='Monomial'):
         # data: DataFrame -- contains all columns including states and time
         # method: basis library used, the default one is monomial library
         self.data = data
         self.differential_order = differential_order
         self.poly_degree = poly_degree
         self.threshold = threshold
+        self.threshold_scan = threshold_scan
         self.Xdot = Xdot
         self.method = method
 
@@ -193,44 +194,101 @@ class Recover_Model_sindy:
         return df
 
     def _plot_pareto(self):
-        indices = np.arange(len(self.data_states))
+        """Compute Pareto-like curves of error vs threshold.
+        This version fits a fresh model for each threshold and computes scores immediately,
+        avoiding the fragile pattern of reusing a single optimizer/model afterward.
+        """
+        import numpy as _np
+        import matplotlib.pyplot as _plt
+        from sklearn.metrics import mean_squared_error as _mse
+
+        # Train/test split on index (no shuffle to preserve time ordering)
+        indices = _np.arange(len(self.data_states))
         train_indices, test_indices = train_test_split(
-            indices, test_size=0.33, random_state=27,shuffle=False
+            indices, test_size=0.33, random_state=27, shuffle=False
         )
 
-        t_train = self.time[train_indices]  
-        t_test = self.time[test_indices]
-        #threshold_scan = np.logspace(np.log10(self.threshold)-3,0,10)
-        coefs = []
-
-        differential_method = ps.FiniteDifference(self.differential_order)
-        if self.method == 'Monomial':
-            feature_library = ps.PolynomialLibrary(self.poly_degree,include_bias=False)
-        elif self.method == 'Chebyshev':
-            feature_library = OrthogonalLibrary(degree=self.poly_degree,method='Chebyshev')
-        elif self.method == 'Legendre':
-            feature_library = OrthogonalLibrary(degree=self.poly_degree,method='Legendre')
+        # Prepare data by basis type
+        method = self.method
         feature_names = self.features
+        t = self.time
+        t_train = t[train_indices]
+        t_test = t[test_indices]
 
-        for i, threshold in enumerate(self.threshold_scan):
-            optimizer = ps.STLSQ(threshold=threshold)
+        # Prepare X / Xdot on the appropriate space
+        if method == 'Monomial':
+            X_all = _np.asarray(self.data_states, dtype=_np.float64)
+            if self.Xdot is None:
+                Xdot_all = _np.gradient(X_all, t, axis=0, edge_order=self.differential_order)
+            else:
+                Xdot_all = _np.asarray(self.Xdot, dtype=_np.float64)
+            X_train, X_test = X_all[train_indices], X_all[test_indices]
+            Xdot_train, Xdot_test = Xdot_all[train_indices], Xdot_all[test_indices]
+            feature_library = ps.PolynomialLibrary(self.poly_degree, include_bias=False)
+        elif method in ('Chebyshev', 'Legendre'):
+            # Use normalized data for orthogonal libraries
+            X_all = _np.asarray(self.data_norm, dtype=_np.float64)
+            # For fair scoring, compute derivative in the same normalized space
+            Xdot_all = _np.gradient(X_all, t, axis=0, edge_order=self.differential_order)
+            X_train, X_test = X_all[train_indices], X_all[test_indices]
+            Xdot_train, Xdot_test = Xdot_all[train_indices], Xdot_all[test_indices]
+            feature_library = OrthogonalLibrary(degree=self.poly_degree, method=method)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+        thresholds = self.threshold_scan if self.threshold_scan is not None else [self.threshold]
+        mse_deriv = _np.zeros(len(thresholds))
+        mse_traj = _np.zeros(len(thresholds))
+
+        for k, thr in enumerate(thresholds):
+            optimizer = ps.STLSQ(threshold=thr)
             model = ps.SINDy(
-            differentiation_method=differential_method,
-            feature_library=feature_library,
-            optimizer=optimizer,
-            feature_names=feature_names
-        )
-            for i, coef in enumerate(coefs):
-                print(f"λ = {self.threshold_scan[i]:.1e}, nonzero = {np.sum(coef != 0)}")
-            if self.method == 'Monomial':
-                x_train, x_test = self.data_states.iloc[train_indices], self.data_states.iloc[test_indices]
-                model.fit(x_train,t=t_train)
-            elif self.method == 'Chebyshev' or 'Legendre':
-                x_train, x_test = self.data_norm.iloc[train_indices], self.data_norm.iloc[test_indices]
-                model.fit(x_train, t=t_train)
-            coefs.append(model.coefficients())
-        
-        return plot_pareto(coefs,optimizer,model,self.threshold_scan,x_test,t_test)
+                feature_library=feature_library,
+                optimizer=optimizer,
+                feature_names=feature_names,
+            )
+            # Fit on training set
+            model.fit(X_train, t=t_train, x_dot=Xdot_train)
+
+            # 1) Derivative-domain error on test set
+            try:
+                mse_deriv[k] = model.score(X_test, t=t_test, x_dot=Xdot_test, metric=_mse)
+            except Exception:
+                # If score fails (shape mismatch, etc.), fall back to manual MSE
+                Xdot_pred = model.predict(X_test)
+                mse_deriv[k] = _np.mean((Xdot_test - Xdot_pred) ** 2)
+
+            # 2) Trajectory-domain error on test set via simulate
+            try:
+                x0 = X_test[0]
+                X_sim = model.simulate(x0, t_test, integrator="odeint")
+                # If simulate explodes, clip to avoid NaNs in MSE
+                if _np.any(~_np.isfinite(X_sim)) or _np.any(_np.abs(X_sim) > 1e6):
+                    X_sim = _np.clip(X_sim, -1e6, 1e6)
+                mse_traj[k] = _np.mean((X_test - X_sim) ** 2)
+            except Exception:
+                mse_traj[k] = _np.nan
+
+        # Plot (do not rely on external helper)
+        _plt.figure()
+        _plt.semilogy(thresholds, mse_deriv, "o-", label=r"$\dot{X}$ RMSE")
+        _plt.xlabel(r"$\lambda$")
+        _plt.xticks(thresholds, [f"{v:.1e}" for v in thresholds])
+        _plt.ylabel(r"Error")
+        _plt.title("Derivative-domain error vs threshold")
+        _plt.grid(True, alpha=0.3)
+        _plt.tight_layout()
+
+        _plt.figure()
+        _plt.semilogy(thresholds, mse_traj, "o-", label="Trajectory RMSE")
+        _plt.xlabel(r"$\lambda$")
+        _plt.ylabel("Error")
+        _plt.xticks(thresholds, [f"{v:.1e}" for v in thresholds])
+        _plt.title("Trajectory-domain error vs threshold")
+        _plt.grid(True, alpha=0.3)
+        _plt.tight_layout()
+
+        return thresholds, mse_deriv, mse_traj
     
 
 def plot_pareto(coefs, opt, model, threshold_scan, x_test, t_test):
@@ -261,7 +319,7 @@ def plot_pareto(coefs, opt, model, threshold_scan, x_test, t_test):
         plt.semilogy(threshold_scan, mse_sim, "b")
         plt.ylabel(r"$\dot{X}$ RMSE", fontsize=20)
         plt.xlabel(r"$\lambda$", fontsize=20)
-        plt.xticks(fontsize=14, rotation=45) 
+        plt.xticks(ontsize=14, rotation=45) 
         plt.tight_layout() 
         plt.yticks(fontsize=16)
         plt.grid(True)
