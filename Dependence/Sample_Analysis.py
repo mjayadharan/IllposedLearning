@@ -267,11 +267,11 @@ class sampling:
 
         if model_name.lower() == 'lotka-volterra':
             # Map standardized names (x1,x2,...) to the Base_test internal names (x,y)
-            model_state_names = model_kwargs.get('state_names', ["x", "y"])  # order matters
-            if len(model_state_names) != 2:
-                raise ValueError("Lotka-Volterra expects exactly 2 model state names.")
-            if len(std_names) < 2:
-                raise ValueError("Lotka-Volterra requires at least two standardized state columns (e.g., x1,x2).")
+            model_state_names = model_kwargs.get('state_names', ["x", "y1","y2"])  # order matters
+            if len(model_state_names) != 3:
+                raise ValueError("Lotka-Volterra expects exactly 3 model state names.")
+            if len(std_names) < 3:
+                raise ValueError("Lotka-Volterra requires at least three standardized state columns (e.g., x1,x2,x3).")
 
             # Build a consistent mapping between model names and standardized names, in order
             model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
@@ -301,7 +301,7 @@ class sampling:
                     t = float(df.loc[i, 'time']) if 'time' in df.columns else float(t_eval[i])
                     # Values in model order
                     state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
-                    dstate = lv.lv_rhs(t, state_vec_model_order)
+                    dstate = lv.lv_rhs_1_2(t, state_vec_model_order)
                     deriv.append(dstate)
                 deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
 
