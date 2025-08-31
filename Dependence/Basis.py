@@ -1,19 +1,54 @@
 import numpy as np
 import pandas as pd
 from dae_finder import PolyFeatureMatrix
-import Comparison
 
 from numpy.polynomial import Polynomial, chebyshev, legendre
 from typing import Iterator, Tuple
 from numpy.typing import NDArray
 from scipy import sparse
 from sklearn.utils.validation import check_is_fitted
+import re
 
 import pysindy as ps
 from pysindy.utils import AxesArray
 from pysindy.utils import comprehend_axes
 from pysindy.feature_library.base import BaseFeatureLibrary
 from pysindy.feature_library.base import x_sequence_or_item
+
+def normalization(data_states):
+    # data_states: DataFrame, only has state columns
+    data_norm = data_states.copy()
+    L,U = {},{}
+    for col in data_norm.columns:
+        Li = data_states[col].min()
+        Ui = data_states[col].max()
+        L[col] = Li
+        U[col] = Ui
+        if Li == Ui:
+            data_norm[col] = 0
+            print("Warning: All values are equal")
+        else:
+            data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
+    return data_norm, L, U
+
+
+def standardize_columns(df,time_col=None):
+    # Convert variables to x1,x2,x3,...
+    if time_col is None:
+        candidate_names = {"t_Exp","t_fine","time"}
+        found = [c for c in df.columns if c in candidate_names]
+        if not found:
+            raise ValueError("Uable to auto-detect time column. Need provide 'time_col'")
+        time_col = found[0]
+    elif isinstance(time_col,str):
+        time_col = [time_col]
+    var_cols = [c for c in df.columns if c not in time_col]
+    new_names = {}
+    for idx, col in enumerate(var_cols, start=1):
+        if not re.fullmatch(r"x\d+", str(col)):
+            new_names[col] = f"x{idx}"
+    return df.rename(columns=new_names),time_col
+
 
 class Monomials:
     def __init__(self,data,degree):
@@ -23,7 +58,7 @@ class Monomials:
         self.data = data
         self.degree = degree
         # data_states only has state columns and has been renamed
-        data_std,self.time_col = Comparison.standardize_columns(self.data)
+        data_std,self.time_col = standardize_columns(self.data)
         self.data_states = data_std.drop(columns=self.time_col)
     
     def _generate_library(self):
