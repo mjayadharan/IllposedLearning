@@ -4,10 +4,21 @@ from scipy.integrate import solve_ivp, odeint
 
 class Lotka_Volterra:
     def __init__(self,params,t_span,t_eval,z0,noise_level=None):
-        self.alpha = params.get("alpha")
-        self.beta = params.get("beta")
-        self.gamma = params.get("gamma")
-        self.delta = params.get("delta")
+        # parameters under the case: 1 prey, 1 predator
+        self.alpha = params.get("alpha", None)
+        self.beta = params.get("beta", None)
+        self.gamma = params.get("gamma", None)
+        self.delta = params.get("delta", None)
+        # parameters under the case: 1 prey, 2 predators
+        self.r = params.get("r", None)
+        self.K = params.get("K", None)
+        self.a1 = params.get("a1", None)
+        self.a2 = params.get("a2", None)
+        self.m1 = params.get("m1", None)
+        self.m2 = params.get("m2", None)
+        self.epsilon1 = params.get("epsilon1", None)
+        self.epsilon2 = params.get("epsilon2", None)
+
         self.t_span = t_span
         self.t_eval = t_eval
         self.z0 = z0
@@ -15,27 +26,45 @@ class Lotka_Volterra:
 
         self.data_sim = self.simulate_lv_condition()
 
-    def lv_rhs(self, t, z):
+    def lv_rhs_1_1(self, t, z):
+        """
+        Lotka-Volterra equations: 1 prey, 1 predator
+        """
         x, y = z
         dxdt = self.alpha * x - self.beta * x * y
         dydt = self.delta * x * y - self.gamma * y
         return [dxdt, dydt]
     
+    def lv_rhs_1_2(self,t,z):
+        """
+        Lotka-Volterra equations: 1 prey, 2 predators
+        """
+        x, y1, y2 = z
+        dxdt = self.r * x * (1 - x / self.K) - self.a1 * x * y1 - self.a2 * x * y2
+        dy1dt = self.epsilon1 * x * y1 - self.m1 * y1
+        dy2dt = self.epsilon2 * x * y2 - self.m2 * y2
+        return [dxdt, dy1dt, dy2dt]
+
     def simulate_lv_condition(self):
-        sol = solve_ivp(self.lv_rhs, self.t_span, self.z0, t_eval=self.t_eval)
+        #sol = solve_ivp(self.lv_rhs_1_1, self.t_span, self.z0, t_eval=self.t_eval)
+        sol = solve_ivp(self.lv_rhs_1_2, self.t_span, self.z0, t_eval=self.t_eval)
         if self.noise_level is None:
             dxdt_vals = []
-            dydt_vals = []
+            dy1dt_vals = []
+            dy2dt_vals = []
             for t, z in zip(sol.t, sol.y.T):
-                dxdt, dydt = self.lv_rhs(t, z)
+                dxdt, dy1dt, dy2dt = self.lv_rhs_1_2(t, z)
                 dxdt_vals.append(dxdt)
-                dydt_vals.append(dydt)
+                dy1dt_vals.append(dy1dt)
+                dy2dt_vals.append(dy2dt)
             df = pd.DataFrame({
                 "time": sol.t,
                 "x": sol.y[0],
-                'y': sol.y[1],
+                'y1': sol.y[1],
+                'y2': sol.y[2],
                 "dxdt": dxdt_vals,
-                "dydt": dydt_vals
+                "dy1dt": dy1dt_vals,
+                "dy2dt": dy2dt_vals
             })
         else:
             x_base = sol.y[0]
