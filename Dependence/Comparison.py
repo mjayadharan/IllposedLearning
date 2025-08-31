@@ -11,7 +11,8 @@ from scipy.interpolate import UnivariateSpline
 from dae_finder import PolyFeatureMatrix,sequentialThLin
 import pysindy as ps
 from Basis import OrthogonalLibrary
-from Multicollinearity import create_combinations_with_stable_svd,filter_combinations
+#from Multicollinearity import create_combinations_with_stable_svd,filter_combinations_cond
+from Multi import SVD_analysis, Regression_analysis
 from math import comb as n_choose_k
 from joblib import Parallel, delayed
 
@@ -186,10 +187,10 @@ class Noise_Free_results:
                 include_interaction=include_interaction_flag
             )
             # Always pass input_feature_names=self.data.columns to preserve order/names
-            library.fit(self.data_states,)
-            candidate_lib = library.transform_to_dataframe(self.data_states, 
+            library.fit(self.data_norm)
+            #candidate_lib = library.transform_to_dataframe(self.data_states, 
                                                            #input_feature_names=self.data_states.columns)
-            #candidate_lib = library.transform_to_dataframe(self.data_norm, 
+            candidate_lib = library.transform_to_dataframe(self.data_norm, 
                                                            input_feature_names=self.data_norm.columns)   
         elif self.method == 'Legendre':
             library = OrthogonalLibrary(
@@ -198,11 +199,11 @@ class Noise_Free_results:
                 include_bias=False,
                 include_interaction=include_interaction_flag
             )
-            library.fit(self.data_states)
-            #candidate_lib = library.transform_to_dataframe(self.data_norm, 
-            #                                               input_feature_names=self.data_norm.columns)
-            candidate_lib = library.transform_to_dataframe(self.data_states, 
-                                                           input_feature_names=self.data_states.columns)
+            library.fit(self.data_norm)
+            candidate_lib = library.transform_to_dataframe(self.data_norm, 
+                                                           input_feature_names=self.data_norm.columns)
+            #candidate_lib = library.transform_to_dataframe(self.data_states, 
+                                                           #input_feature_names=self.data_states.columns)
 
         return candidate_lib
     
@@ -212,8 +213,11 @@ class Noise_Free_results:
         num_library_terms = len(candidate_lib.columns)
         # Number of combinations
         num_combinations = n_choose_k(num_library_terms, comb)
-        comb_processed,comb_original = create_combinations_with_stable_svd(candidate_lib,comb)
-        filtered,_ = filter_combinations(comb_processed,comb_original,threshold=20)
+        #SVD_analyzer = SVD_analysis(candidate_lib,comb)
+        Regression_analyzer = Regression_analysis(candidate_lib,comb)
+        #comb_processed,comb_original = create_combinations_with_stable_svd(candidate_lib,comb)
+        #filtered,_ = filter_combinations_cond(comb_processed,comb_original,threshold=20)
+        filtered = Regression_analyzer.filtered_result
         # Number of ill-posed combinations with comb
         num_ill_comb = len(filtered)
 
