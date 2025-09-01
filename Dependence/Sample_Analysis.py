@@ -180,10 +180,26 @@ class sampling:
         self.data_states = Creator.data_states
         self.time_col = Creator.time_col
         self.state_cols = self.data_states.columns.tolist()
-    
+
+    def _prepare_outdir(self, out_path, n_step, filename_prefix):
+        """Ensure output directory contains a run tag with num & n_step.
+        If `out_path` already includes the tag, reuse it; otherwise create
+        a subdirectory like: {filename_prefix}_{distribution}_n{num}_pts{n_step}.
+        Returns (final_dir, tag).
+        """
+        tag = f"n{int(self.num)}_pts{int(n_step)}"
+        base = str(out_path)
+        # If any path component already contains the tag, don't nest again
+        if any(tag in part for part in Path(base).parts):
+            final_dir = base
+        else:
+            final_dir = os.path.join(base, f"{filename_prefix}_{self.distribution}_{tag}")
+        os.makedirs(final_dir, exist_ok=True)
+        return final_dir, tag
+
     def fit_and_save(self,sbml_path:str,out_path:str,start,end,n_step,
                      filename_prefix="IC"):
-        os.makedirs(out_path,exist_ok=True)
+        out_dir, tag = self._prepare_outdir(out_path, n_step, filename_prefix)
         rr = te.loadSBMLModel(sbml_path)
         species_ids = list(rr.model.getFloatingSpeciesIds())
         self.ID = species_ids
@@ -223,7 +239,7 @@ class sampling:
             derivative_df = pd.DataFrame(rates_list, columns=[f'd{s}/dt' for s in species_ids])
             data_augmented = pd.concat([df, derivative_df], axis=1)
 
-            fp = os.path.join(out_path, f"{filename_prefix}_{k:03d}.xlsx")
+            fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
             data_augmented.to_excel(fp, index=False)
             filepaths.append(fp)
 
@@ -253,7 +269,7 @@ class sampling:
               - state_names: list[str] giving the model's internal state names
                 (default ["S","E","ES","P"]).
         """
-        os.makedirs(out_path, exist_ok=True)
+        out_dir, tag = self._prepare_outdir(out_path, n_step, filename_prefix)
 
         # Use the standardized names coming from create_initial_conditions, e.g. ['x1','x2', ...]
         std_names = list(self.sample_orig.columns)
@@ -306,7 +322,7 @@ class sampling:
                 deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
 
                 data_augmented = pd.concat([df, deriv_df], axis=1)
-                fp = os.path.join(out_path, f"{filename_prefix}_{k:03d}.xlsx")
+                fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                 data_augmented.to_excel(fp, index=False)
                 filepaths.append(fp)
 
@@ -346,7 +362,7 @@ class sampling:
                 deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
 
                 data_augmented = pd.concat([df, deriv_df], axis=1)
-                fp = os.path.join(out_path, f"{filename_prefix}_{k:03d}.xlsx")
+                fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                 data_augmented.to_excel(fp, index=False)
                 filepaths.append(fp)
         
