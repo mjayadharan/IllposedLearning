@@ -16,14 +16,26 @@ from Base_test import Lotka_Volterra, CRN
 
 
 # Helper for parallel analysis
-def _process_combo(data, distribution, sbml_path, num, n_step, start, end, degree_list, comb_list, method, out_dir_str):
+def _process_combo(data, distribution, sbml_path, model_name, model_kwargs,
+                   num, n_step, start, end, degree_list, comb_list, method, out_dir_str):
     """Worker: run one (num, n_step) combo and return summary dict."""
     # Ensure directory exists in worker
     os.makedirs(out_dir_str, exist_ok=True)
 
     # Build sampler and simulate
     Sample = sampling(data, int(num), distribution=distribution)
-    filepaths = Sample.fit_and_save(sbml_path, out_dir_str, start, end, int(n_step))
+    if sbml_path is not None:
+        filepaths = Sample.fit_and_save(sbml_path, out_dir_str, start, end, int(n_step))
+    elif model_name is not None:
+        mk = model_kwargs or {}
+        filepaths = Sample.fit_and_save_base(model_name=model_name,
+                                             out_path=out_dir_str,
+                                             start=start,
+                                             end=end,
+                                             n_step=int(n_step),
+                                             **mk)
+    else:
+        raise ValueError("Either sbml_path or model_name must be provided to simulate trajectories.")
 
     # Subsample
     subsample = Sample._subsample(filepaths)
@@ -831,19 +843,22 @@ class distribution_test:
 
 
 class Trend_IC_time:
-    def __init__(self,data,num_list,distribution,sbml_path,start_list,end_list,time_interval,n_steps_list,
-                 degree_list, comb_list, method):
+    def __init__(self,data,num_list,distribution,sbml_path=None,start_list=None,end_list=None,time_interval=None,n_steps_list=None,
+                 degree_list=None, comb_list=None, method=None, model_name=None, out_root=None, model_kwargs=None):
         self.data = data
         self.num_list = num_list
         self.distribution = distribution
         self.sbml_path = sbml_path
-        self.start_list = start_list
-        self.end_list = end_list
+        self.start_list = start_list if start_list is not None else []
+        self.end_list = end_list if end_list is not None else []
         self.time_interval = time_interval
-        self.n_steps_list = n_steps_list
-        self.degree_list = degree_list
-        self.comb_list = comb_list
+        self.n_steps_list = n_steps_list if n_steps_list is not None else []
+        self.degree_list = degree_list if degree_list is not None else []
+        self.comb_list = comb_list if comb_list is not None else []
         self.method = method
+        self.model_name = model_name
+        self.model_kwargs = model_kwargs or {}
+        self.out_root = out_root  # optional base directory for outputs when sbml_path is None
 
         #self.results = self._analysis_summary()
         self.results = self._analysis_summary_parallel()
@@ -852,7 +867,17 @@ class Trend_IC_time:
 
     def _analysis_summary(self):
         results = []
-        base_dir = Path(self.sbml_path).parent
+        if self.out_root is not None:
+            base_dir = Path(self.out_root)
+        elif self.sbml_path is not None:
+            base_dir = Path(self.sbml_path).parent
+        else:
+            base_dir = Path.cwd()
+
+        if self.distribution == 'uniform':
+            base_dir = base_dir / "IC_uniform"
+        elif self.distribution == 'arcsine':
+            base_dir = base_dir / "IC_arcsine"
 
         # helper to fetch start/end given index in n_steps_list
         def _get_start_end(idx):
@@ -881,7 +906,15 @@ class Trend_IC_time:
                 out_path.mkdir(parents=True, exist_ok=True)
 
                 Sample = sampling(self.data, int(num), distribution=self.distribution)
-                filepaths = Sample.fit_and_save(self.sbml_path, str(out_path), start, end, int(n_step))
+                if self.sbml_path is not None:
+                    filepaths = Sample.fit_and_save(self.sbml_path, str(out_path), start, end, int(n_step))
+                elif self.model_name is not None:
+                    filepaths = Sample.fit_and_save_base(model_name=self.model_name,
+                                                         out_path=str(out_path),
+                                                         start=start, end=end, n_step=int(n_step),
+                                                         **(self.model_kwargs or {}))
+                else:
+                    raise ValueError("Either sbml_path or model_name must be provided in Trend_IC_time.")
 
                 subsample = Sample._subsample(filepaths)
 
@@ -1051,6 +1084,68 @@ class Trend_IC_time:
             mk_cycle = list(itertools.islice(itertools.cycle(markers), len(deg_cols)))
             return {dc: mk_cycle[i] for i, dc in enumerate(deg_cols)}
 
+        def _fmt_val(val):
+            try:
+                v = float(val)
+                return f"{v:.2f}"
+            except Exception:
+                return str(val)
+
+        def _ytick_fontprops(ax):
+            # Try to mirror the ytick label font (size/family) for value labels on the axis
+            try:
+                ticks = ax.yaxis.get_ticklabels()
+                for t in ticks:
+                    if t.get_text() != '':
+                        return t.get_fontproperties()
+                if len(ticks) > 0:
+                    return ticks[0].get_fontproperties()
+            except Exception:
+                pass
+            # Fallback to axis default
+            from matplotlib import font_manager as fm
+            fp = fm.FontProperties()
+            try:
+                fs = plt.rcParams.get('ytick.labelsize', None)
+                if fs is not None:
+                    fp.set_size(fs)
+            except Exception:
+                pass
+            return fp
+
+        def _is_on_tick(ax, y):
+            """Return True if y coincides with an existing y‑tick (within tolerance)."""
+            try:
+                yt = ax.get_yticks()
+                if yt is None or len(yt) == 0:
+                    return False
+                y_min, y_max = ax.get_ylim()
+                tol = 0.01 * (y_max - y_min)  # 1% of axis range
+                return np.any(np.isclose(yt, float(y), rtol=0.0, atol=tol))
+            except Exception:
+                return False
+
+        # Precompute time-interval mapping (ΔT) strictly from user input when available
+        default_interval = None
+        step_interval_map = {}
+        try:
+            if self.time_interval is not None:
+                # Always prefer the explicit time_interval provided by the user
+                default_interval = float(self.time_interval)
+            else:
+                if (self.start_list is not None and self.end_list is not None
+                        and len(self.start_list) > 0 and len(self.end_list) > 0):
+                    if len(self.start_list) == len(self.n_steps_list) == len(self.end_list):
+                        for ns, st, ed in zip(self.n_steps_list, self.start_list, self.end_list):
+                            try:
+                                step_interval_map[int(ns)] = float(ed) - float(st)
+                            except Exception:
+                                continue
+                    elif len(self.start_list) == 1 and len(self.end_list) == 1:
+                        default_interval = float(self.end_list[0]) - float(self.start_list[0])
+        except Exception:
+            pass
+
         def _plot_case_fix_num(tbl, comb_tag):
             if tbl is None or tbl.empty:
                 return None
@@ -1062,15 +1157,55 @@ class Trend_IC_time:
             nums = sorted(tbl['num'].unique())
             r, c = _subplot_grid(len(nums))
             fig, axes = plt.subplots(r, c, figsize=(4.5*c, 3.5*r), squeeze=False, sharex=False, sharey=False)
+            show_value_guides = True
             for i, num in enumerate(nums):
                 ax = axes[i//c][i%c]
                 sub = tbl[tbl['num'] == num].sort_values('n_step')
-                x = sub['n_step'].values
+                x_raw = sub['n_step'].values
+                x = x_raw - 1  # use n_steps - 1 on the x-axis
                 for dc in deg_cols:
                     y = sub[dc].values
                     ax.plot(x, y, marker=marker_map[dc], label=dc.split('_')[0], color=color_map[dc])
+                # value guides: dashed horizontal to y-axis + value label on the axis
+                if show_value_guides:
+                    x_min, x_max = ax.get_xlim()
+                    trans = ax.get_yaxis_transform()
+                    for dc in deg_cols:
+                        y = sub[dc].values
+                        for xi, yi in zip(x, y):
+                            try:
+                                ax.hlines(yi, x_min, xi, linestyles='dashed', linewidth=0.6,
+                                          color=color_map[dc], alpha=0.35)
+                                fp = _ytick_fontprops(ax)
+                                if not _is_on_tick(ax, yi):
+                                    ax.text(-0.02, yi, _fmt_val(yi), transform=trans,
+                                            ha='right', va='center', fontproperties=fp,
+                                            color=ax.yaxis.label.get_color(), clip_on=False)
+                            except Exception:
+                                continue
+                # annotate time interval (ΔT)
+                try:
+                    label_str = None
+                    if default_interval is not None:
+                        label_str = f"ΔT={default_interval:g}"
+                    else:
+                        # collect intervals for these n_steps (raw values)
+                        uniq_steps = sorted(set(map(int, x_raw.tolist())))
+                        intervals = {step_interval_map.get(ns) for ns in uniq_steps}
+                        intervals.discard(None)
+                        if len(intervals) == 1:
+                            label_str = f"ΔT={next(iter(intervals)):.6g}"
+                        elif len(intervals) > 1:
+                            label_str = "ΔT varies"
+                    if label_str:
+                        ax.text(0.98, 0.98, label_str, transform=ax.transAxes,
+                                ha='right', va='top', fontsize=8,
+                                bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1.5))
+                except Exception:
+                    pass
+
                 ax.set_title(f"num={num}")
-                ax.set_xlabel('n_step')
+                ax.set_xlabel('time_step (n_step-1)')
                 ax.set_ylabel(f"# ill-posed ({comb_tag})")
                 ax.grid(alpha=0.3)
                 ax.legend(fontsize=8)
@@ -1093,6 +1228,7 @@ class Trend_IC_time:
             steps = sorted(tbl['n_step'].unique())
             r, c = _subplot_grid(len(steps))
             fig, axes = plt.subplots(r, c, figsize=(4.5*c, 3.5*r), squeeze=False, sharex=False, sharey=False)
+            show_value_guides = True
             for i, ns in enumerate(steps):
                 ax = axes[i//c][i%c]
                 sub = tbl[tbl['n_step'] == ns].sort_values('num')
@@ -1100,6 +1236,39 @@ class Trend_IC_time:
                 for dc in deg_cols:
                     y = sub[dc].values
                     ax.plot(x, y, marker=marker_map[dc], label=dc.split('_')[0], color=color_map[dc])
+                # value guides: dashed horizontal to y-axis + value label on the axis
+                if show_value_guides:
+                    x_min, x_max = ax.get_xlim()
+                    trans = ax.get_yaxis_transform()
+                    for dc in deg_cols:
+                        y = sub[dc].values
+                        for xi, yi in zip(x, y):
+                            try:
+                                ax.hlines(yi, x_min, xi, linestyles='dashed', linewidth=0.6,
+                                          color=color_map[dc], alpha=0.35)
+                                fp = _ytick_fontprops(ax)
+                                if not _is_on_tick(ax, yi):
+                                    ax.text(-0.02, yi, _fmt_val(yi), transform=trans,
+                                            ha='right', va='center', fontproperties=fp,
+                                            color=ax.yaxis.label.get_color(), clip_on=False)
+                            except Exception:
+                                continue
+                # annotate time interval (ΔT) for this n_step
+                try:
+                    label_str = None
+                    if default_interval is not None:
+                        label_str = f"ΔT={default_interval:g}"
+                    else:
+                        dt = step_interval_map.get(int(ns))
+                        if dt is not None:
+                            label_str = f"ΔT={dt:.6g}"
+                    if label_str:
+                        ax.text(0.98, 0.98, label_str, transform=ax.transAxes,
+                                ha='right', va='top', fontsize=8,
+                                bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1.5))
+                except Exception:
+                    pass
+
                 ax.set_title(f"n_step={ns}")
                 ax.set_xlabel('num (initial_conditions)')
                 ax.set_ylabel(f"# ill-posed ({comb_tag})")
@@ -1126,7 +1295,12 @@ class Trend_IC_time:
         return figs
 
     def _analysis_summary_parallel(self, n_jobs=-1, backend='loky'):
-        base_dir = Path(self.sbml_path).parent
+        if self.out_root is not None:
+            base_dir = Path(self.out_root)
+        elif self.sbml_path is not None:
+            base_dir = Path(self.sbml_path).parent
+        else:
+            base_dir = Path.cwd()
 
         def _get_start_end(idx):
             if len(self.start_list) == len(self.n_steps_list):
@@ -1151,23 +1325,23 @@ class Trend_IC_time:
                 tasks.append((num, n_step, start, end, str(out_path)))
 
         # Parallel execution
-        results = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes')(
-            [
-                delayed(_process_combo)(
-                    self.data,
-                    self.distribution,
-                    self.sbml_path,
-                    num,
-                    n_step,
-                    start,
-                    end,
-                    self.degree_list,
-                    self.comb_list,
-                    self.method,
-                    out_dir_str,
-                ) for (num, n_step, start, end, out_dir_str) in tasks
-            ]
-        )
+        results = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes')([
+            delayed(_process_combo)(
+                self.data,
+                self.distribution,
+                self.sbml_path,
+                self.model_name,
+                self.model_kwargs,
+                num,
+                n_step,
+                start,
+                end,
+                self.degree_list,
+                self.comb_list,
+                self.method,
+                out_dir_str,
+            ) for (num, n_step, start, end, out_dir_str) in tasks
+        ])
 
         self.results = results
         self.ill2_table, self.ill3_table = self._modify_pattern(degree_start=1, fill=None, keep_max_col=True)
