@@ -1038,7 +1038,13 @@ class Trend_IC_time:
 
         return ill2_table, ill3_table
 
-    def plot_illposed_tables(self, which='both'):
+    def plot_illposed_tables(self, which='both', *,
+                             label_points: bool = True,
+                             label_every: int = 1,
+                             label_last_only: bool = False,
+                             fmt: str = '{:.2f}',
+                             show_value_guides: bool = False,
+                             show_delta_t: bool = False):
         """
         Plot ill-posed counts versus n_step and num for both comb-number tables.
         In Jupyter, figures will be displayed (no saving).
@@ -1048,6 +1054,7 @@ class Trend_IC_time:
         which : {'both','ill2','ill3'}
             Which tables to plot. 'both' will attempt ill2 then ill3 if available.
         """
+        import matplotlib.patheffects as pe
         def _degree_cols(tbl, comb_tag):
             if tbl is None or tbl.empty:
                 return []
@@ -1086,8 +1093,7 @@ class Trend_IC_time:
 
         def _fmt_val(val):
             try:
-                v = float(val)
-                return f"{v:.2f}"
+                return fmt.format(float(val))
             except Exception:
                 return str(val)
 
@@ -1125,26 +1131,22 @@ class Trend_IC_time:
             except Exception:
                 return False
 
-        # Precompute time-interval mapping (ΔT) strictly from user input when available
-        default_interval = None
-        step_interval_map = {}
-        try:
-            if self.time_interval is not None:
-                # Always prefer the explicit time_interval provided by the user
-                default_interval = float(self.time_interval)
-            else:
-                if (self.start_list is not None and self.end_list is not None
-                        and len(self.start_list) > 0 and len(self.end_list) > 0):
-                    if len(self.start_list) == len(self.n_steps_list) == len(self.end_list):
-                        for ns, st, ed in zip(self.n_steps_list, self.start_list, self.end_list):
-                            try:
-                                step_interval_map[int(ns)] = float(ed) - float(st)
-                            except Exception:
-                                continue
-                    elif len(self.start_list) == 1 and len(self.end_list) == 1:
-                        default_interval = float(self.end_list[0]) - float(self.start_list[0])
-        except Exception:
-            pass
+        def _is_zero(y):
+            """Return True if y is (numerically or formatted) zero based on current fmt."""
+            try:
+                yf = float(y)
+            except Exception:
+                return False
+            # numeric near-zero
+            if abs(yf) <= 1e-12:
+                return True
+            # formatted zero under the provided fmt string
+            try:
+                return float(fmt.format(yf)) == 0.0
+            except Exception:
+                return False
+
+        # ΔT/time-interval mapping block removed
 
         def _plot_case_fix_num(tbl, comb_tag):
             if tbl is None or tbl.empty:
@@ -1156,8 +1158,7 @@ class Trend_IC_time:
             marker_map = _marker_map_for_degrees(deg_cols)
             nums = sorted(tbl['num'].unique())
             r, c = _subplot_grid(len(nums))
-            fig, axes = plt.subplots(r, c, figsize=(4.5*c, 3.5*r), squeeze=False, sharex=False, sharey=False)
-            show_value_guides = True
+            fig, axes = plt.subplots(r, c, figsize=(6.0*c, 4.5*r), squeeze=False, sharex=False, sharey=False)
             for i, num in enumerate(nums):
                 ax = axes[i//c][i%c]
                 sub = tbl[tbl['num'] == num].sort_values('n_step')
@@ -1166,43 +1167,22 @@ class Trend_IC_time:
                 for dc in deg_cols:
                     y = sub[dc].values
                     ax.plot(x, y, marker=marker_map[dc], label=dc.split('_')[0], color=color_map[dc])
-                # value guides: dashed horizontal to y-axis + value label on the axis
-                if show_value_guides:
-                    x_min, x_max = ax.get_xlim()
-                    trans = ax.get_yaxis_transform()
+                # annotate point values near markers (cleaner than y-axis labels)
+                if label_points:
+                    fp = _ytick_fontprops(ax)
                     for dc in deg_cols:
                         y = sub[dc].values
-                        for xi, yi in zip(x, y):
-                            try:
-                                ax.hlines(yi, x_min, xi, linestyles='dashed', linewidth=0.6,
-                                          color=color_map[dc], alpha=0.35)
-                                fp = _ytick_fontprops(ax)
-                                if not _is_on_tick(ax, yi):
-                                    ax.text(-0.02, yi, _fmt_val(yi), transform=trans,
-                                            ha='right', va='center', fontproperties=fp,
-                                            color=ax.yaxis.label.get_color(), clip_on=False)
-                            except Exception:
+                        for j,(xi, yi) in enumerate(zip(x, y)):
+                            if label_last_only and j != len(x)-1:
                                 continue
-                # annotate time interval (ΔT)
-                try:
-                    label_str = None
-                    if default_interval is not None:
-                        label_str = f"ΔT={default_interval:g}"
-                    else:
-                        # collect intervals for these n_steps (raw values)
-                        uniq_steps = sorted(set(map(int, x_raw.tolist())))
-                        intervals = {step_interval_map.get(ns) for ns in uniq_steps}
-                        intervals.discard(None)
-                        if len(intervals) == 1:
-                            label_str = f"ΔT={next(iter(intervals)):.6g}"
-                        elif len(intervals) > 1:
-                            label_str = "ΔT varies"
-                    if label_str:
-                        ax.text(0.98, 0.98, label_str, transform=ax.transAxes,
-                                ha='right', va='top', fontsize=8,
-                                bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1.5))
-                except Exception:
-                    pass
+                            if (not label_last_only) and (label_every > 1) and (j % int(label_every) != 0):
+                                continue
+                            if _is_zero(yi):
+                                continue
+                            ax.annotate(_fmt_val(yi), xy=(xi, yi), xytext=(4, 0), textcoords='offset points',
+                                        ha='left', va='center', fontproperties=fp,
+                                        color=ax.yaxis.label.get_color(),
+                                        path_effects=[pe.withStroke(linewidth=3, foreground='white', alpha=0.85)])
 
                 ax.set_title(f"num={num}")
                 ax.set_xlabel('time_step (n_step-1)')
@@ -1227,8 +1207,7 @@ class Trend_IC_time:
             marker_map = _marker_map_for_degrees(deg_cols)
             steps = sorted(tbl['n_step'].unique())
             r, c = _subplot_grid(len(steps))
-            fig, axes = plt.subplots(r, c, figsize=(4.5*c, 3.5*r), squeeze=False, sharex=False, sharey=False)
-            show_value_guides = True
+            fig, axes = plt.subplots(r, c, figsize=(6.0*c, 4.5*r), squeeze=False, sharex=False, sharey=False)
             for i, ns in enumerate(steps):
                 ax = axes[i//c][i%c]
                 sub = tbl[tbl['n_step'] == ns].sort_values('num')
@@ -1236,38 +1215,21 @@ class Trend_IC_time:
                 for dc in deg_cols:
                     y = sub[dc].values
                     ax.plot(x, y, marker=marker_map[dc], label=dc.split('_')[0], color=color_map[dc])
-                # value guides: dashed horizontal to y-axis + value label on the axis
-                if show_value_guides:
-                    x_min, x_max = ax.get_xlim()
-                    trans = ax.get_yaxis_transform()
+                if label_points:
+                    fp = _ytick_fontprops(ax)
                     for dc in deg_cols:
                         y = sub[dc].values
-                        for xi, yi in zip(x, y):
-                            try:
-                                ax.hlines(yi, x_min, xi, linestyles='dashed', linewidth=0.6,
-                                          color=color_map[dc], alpha=0.35)
-                                fp = _ytick_fontprops(ax)
-                                if not _is_on_tick(ax, yi):
-                                    ax.text(-0.02, yi, _fmt_val(yi), transform=trans,
-                                            ha='right', va='center', fontproperties=fp,
-                                            color=ax.yaxis.label.get_color(), clip_on=False)
-                            except Exception:
+                        for j,(xi, yi) in enumerate(zip(x, y)):
+                            if label_last_only and j != len(x)-1:
                                 continue
-                # annotate time interval (ΔT) for this n_step
-                try:
-                    label_str = None
-                    if default_interval is not None:
-                        label_str = f"ΔT={default_interval:g}"
-                    else:
-                        dt = step_interval_map.get(int(ns))
-                        if dt is not None:
-                            label_str = f"ΔT={dt:.6g}"
-                    if label_str:
-                        ax.text(0.98, 0.98, label_str, transform=ax.transAxes,
-                                ha='right', va='top', fontsize=8,
-                                bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1.5))
-                except Exception:
-                    pass
+                            if (not label_last_only) and (label_every > 1) and (j % int(label_every) != 0):
+                                continue
+                            if _is_zero(yi):
+                                continue
+                            ax.annotate(_fmt_val(yi), xy=(xi, yi), xytext=(4, 0), textcoords='offset points',
+                                        ha='left', va='center', fontproperties=fp,
+                                        color=ax.yaxis.label.get_color(),
+                                        path_effects=[pe.withStroke(linewidth=3, foreground='white', alpha=0.85)])
 
                 ax.set_title(f"n_step={ns}")
                 ax.set_xlabel('num (initial_conditions)')
