@@ -49,6 +49,7 @@ class SVD_analysis:
         self.blas_threads = int(blas_threads)
         
         self.combination_results_processed, self.combination_results_original = self._create_combinations_with_stable_svd()
+        self.filtered_result, self.dropped_result = self._filter_combinations_cond()
 
     def _create_combinations_with_stable_svd(self):
         # Preprocess data for numerical stability
@@ -444,4 +445,493 @@ class Regression_analysis:
         self.filtered_processed_df = df_proc_filt.reset_index(drop=True)
         self.filtered_result = filtered_result
 
+        return filtered_result
+
+
+# --------------------- Fast correlation-matrix-based regression analysis ---------------------
+class Regression_analysis_advanced:
+    """
+    Fast regression analysis using correlation-matrix closed forms (no per-combo fitting).
+
+    Supports pair (comb=2) and triplet (comb=3) combinations. For each combination,
+    evaluate all choices of the dependent variable y and keep the relation with the
+    largest R^2. R^2 and coefficients are computed from the correlation matrix and
+    (mu, sigma) without performing OLS fits.
+
+    Evaluation Modes:
+    -----------------
+    - Method A (default): Use all data to compute correlation/statistics and evaluate R^2 (closed-form, train R^2).
+    - Method B (use_split=True): Data is split into train/test. Closed-form coefficients are computed from training statistics,
+      and the evaluation R^2 can be computed on the test set (r2_eval='test') or on the training set (r2_eval='train').
+      This allows assessment of out-of-sample performance using closed-form regression.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Input dataframe (candidate function library)
+    comb : int
+        Number of terms in each combination (must be 2 or 3)
+    preprocessing : str
+        Preprocessing method for numerical stability
+    threshold : float
+        R^2 threshold for keeping a combination (applied after evaluation)
+    n_jobs, backend, batch_size, max_nbytes, chunk_size, blas_threads, array_dtype : parallel and numeric options
+    keep_equation, keep_coef : store equation string/coefficients in results
+    tie_rule_pairs : how to choose y in pairs when variances are tied ('larger_var' or 'first')
+    use_split : bool, default True
+        Whether to split data into train/test and evaluate R^2 on test set (Method B). If False, uses full data (Method A).
+    test_size : float, default 0.33
+        Fraction of data to use as test set if use_split is True.
+    random_state : int, default 27
+        Random seed for train/test split.
+    r2_eval : {'test','train'}, default 'test'
+        If use_split is True, whether to evaluate R^2 on test set ('test') or training set ('train').
+    """
+
+    def __init__(self, data, comb, preprocessing='standardize', threshold=0.95,
+                 n_jobs=-1, backend='loky', batch_size=8, max_nbytes='16M',
+                 chunk_size=1000, blas_threads=1, array_dtype='float32',
+                 keep_equation=True, keep_coef=True, tie_rule_pairs='larger_var',
+                 use_split=True, test_size=0.33, random_state=27, r2_eval='test'):
+        self.data = data
+        self.comb = int(comb)
+        if self.comb not in (2, 3):
+            raise ValueError("Regression_analysis_advanced supports comb=2 or comb=3 only")
+        self.preprocessing = preprocessing
+        self.threshold = float(threshold)
+        self.n_jobs = n_jobs
+        self.backend = backend
+        self.batch_size = batch_size
+        self.max_nbytes = max_nbytes
+        self.chunk_size = int(chunk_size)
+        self.blas_threads = int(blas_threads)
+        self.array_dtype = str(array_dtype)
+        self.keep_equation = bool(keep_equation)
+        self.keep_coef = bool(keep_coef)
+        self.tie_rule_pairs = tie_rule_pairs  # 'larger_var' or 'first'
+        self.use_split = bool(use_split)
+        self.test_size = float(test_size)
+        self.random_state = random_state
+        assert r2_eval in ('test', 'train')
+        self.r2_eval = r2_eval
+
+        # Limit BLAS oversubscription (consistent with Regression_analysis)
+        os.environ.setdefault('OMP_NUM_THREADS', str(self.blas_threads))
+        os.environ.setdefault('OPENBLAS_NUM_THREADS', str(self.blas_threads))
+        os.environ.setdefault('MKL_NUM_THREADS', str(self.blas_threads))
+        os.environ.setdefault('NUMEXPR_NUM_THREADS', str(self.blas_threads))
+
+        # Compute results now
+        self.run()
+        # And compute filtered_result as in Regression_analysis
+        self.filtered_result = self.filter_by_r2(threshold=self.threshold)
+
+    # --------------------- helpers (static) ---------------------
+    @staticmethod
+    def _corrcoef_from_array(X):
+        """Return (C, mu, sig) where C is feature-wise correlation matrix."""
+        X = np.asarray(X, dtype=float)
+        mu = X.mean(axis=0)
+        Xc = X - mu
+        sig = Xc.std(axis=0, ddof=0)
+        # Avoid zeros
+        sig_safe = np.clip(sig, 1e-15, None)
+        Z = Xc / sig_safe
+        C = (Z.T @ Z) / Z.shape[0]
+        np.fill_diagonal(C, 1.0)
+        C = np.clip(C, -1.0, 1.0)
+        return C, mu, sig
+
+    @staticmethod
+    def _r2_from_corr(a, b=None, c=None):
+        """
+        Closed-form R^2.
+        - If b is None: pair case, return a^2 where a=r_yx.
+        - Else: triplet case with a=r_yx1, b=r_yx2, c=r_x1x2.
+        """
+        if b is None:
+            r = a
+            return float(np.clip(r*r, 0.0, 1.0))
+        # triplet
+        denom = 1.0 - c*c
+        if denom < 1e-15:
+            denom = 1e-15
+        num = a*a + b*b - 2.0*a*b*c
+        r2 = num / denom
+        return float(np.clip(r2, 0.0, 1.0))
+
+    @staticmethod
+    def _beta_pair_from_corr(r_yx, sig_y, sig_x, mu_y, mu_x):
+        beta = r_yx * (sig_y / (sig_x + 1e-15))
+        alpha = mu_y - beta * mu_x
+        return float(beta), float(alpha)
+
+    @staticmethod
+    def _beta_triplet_from_corr(a, b, c, sig_y, sig_u, sig_v, mu_y, mu_u, mu_v):
+        # standardized betas
+        denom = 1.0 - c*c
+        if denom < 1e-15:
+            denom = 1e-15
+        b1_std = (a - b*c) / denom
+        b2_std = (b - a*c) / denom
+        # unstandardize
+        b1 = b1_std * (sig_y / (sig_u + 1e-15))
+        b2 = b2_std * (sig_y / (sig_v + 1e-15))
+        alpha = mu_y - (b1 * mu_u + b2 * mu_v)
+        return float(b1), float(b2), float(alpha)
+
+    @staticmethod
+    def _combo_chunks(n_features, k, chunk_size):
+        from itertools import combinations
+        buf = []
+        combo_id = 0
+        for combo in combinations(range(n_features), k):
+            buf.append((combo_id, combo))
+            combo_id += 1
+            if len(buf) >= chunk_size:
+                yield buf
+                buf = []
+        if buf:
+            yield buf
+
+    # --------------------- core computation ---------------------
+    def _create_combinations_corr_based(self):
+        """
+        Generate combinations for BOTH ORIGINAL and PROCESSED branches using
+        correlation-based closed forms (no per-combo fitting).
+
+        Returns ((results_original_list, results_original_dict),
+                 (results_processed_list, results_processed_dict)).
+        """
+        # preprocess once
+        processed_data, preproc_info = Definitions.preprocess_for_stable(self.data, self.preprocessing)
+        column_names = processed_data.columns.tolist()
+        n_cols = len(column_names)
+        if self.comb > n_cols:
+            raise ValueError(f"Combination size ({self.comb}) cannot exceed number of terms ({n_cols})")
+
+        # cast arrays
+        arr_proc = processed_data.values.astype(self.array_dtype, copy=False)
+        arr_orig = self.data[column_names].values.astype(self.array_dtype, copy=False)
+
+        # Method B: train/test split and stats on train
+        if self.use_split:
+            n_samples = arr_proc.shape[0]
+            idx = np.arange(n_samples)
+            train_idx, test_idx = train_test_split(idx, test_size=self.test_size, random_state=self.random_state, shuffle=True)
+            arr_proc_tr = arr_proc[train_idx]
+            arr_proc_te = arr_proc[test_idx]
+            arr_orig_tr = arr_orig[train_idx]
+            arr_orig_te = arr_orig[test_idx]
+            C_proc, mu_proc, sig_proc = self._corrcoef_from_array(arr_proc_tr)
+            C_orig, mu_orig, sig_orig = self._corrcoef_from_array(arr_orig_tr)
+        else:
+            arr_proc_te = arr_proc
+            arr_orig_te = arr_orig
+            C_proc, mu_proc, sig_proc = self._corrcoef_from_array(arr_proc)
+            C_orig, mu_orig, sig_orig = self._corrcoef_from_array(arr_orig)
+
+        k = self.comb
+        n_total = n_choose_k(n_cols, k)
+        results_orig_list = [None] * n_total
+        results_orig_dict = {}
+        results_proc_list = [None] * n_total
+        results_proc_dict = {}
+
+        # local shortcuts to avoid pickling self
+        tie_rule_pairs = self.tie_rule_pairs
+        keep_eq = self.keep_equation
+        keep_cf = self.keep_coef
+        threshold = self.threshold
+        backend = self.backend
+        batch_size = self.batch_size
+        max_nbytes = self.max_nbytes
+        n_jobs = self.n_jobs
+
+        def _format_equation_pair(target_name, beta, intercept, feat_name):
+            if not keep_eq:
+                return None
+            rhs = f"{beta:+.6g}*{feat_name}"
+            if abs(intercept) > 1e-12:
+                rhs += f" {intercept:+.6g}"
+            # strip leading '+'
+            rhs = rhs.lstrip()
+            return f"{target_name} = {rhs}"
+
+        def _format_equation_triplet(target_name, coef_tuple, intercept, feat_names):
+            if not keep_eq:
+                return None
+            parts = []
+            for c, fn in zip(coef_tuple, feat_names):
+                if abs(c) < 1e-12:
+                    continue
+                parts.append(f" {c:+.6g}*{fn}")
+            rhs = '0' if not parts else ''.join(parts)
+            if abs(intercept) > 1e-12:
+                rhs += f" {intercept:+.6g}"
+            rhs = rhs.strip()
+            return f"{target_name} = {rhs}"
+
+        def _process_one_branch(pair, C, mu, sig, preproc_label, X_test=None):
+            combo_id, idx_tuple = pair
+            cols = list(idx_tuple)
+            terms = tuple(column_names[i] for i in cols)
+
+            if k == 2:
+                i, j = cols
+                # For pairs: evaluate both choices of dependent variable
+                candidates = []
+                for (y_idx, x_idx) in [(i, j), (j, i)]:
+                    y_name = column_names[y_idx]
+                    x_name = column_names[x_idx]
+                    r = C[y_idx, x_idx]
+                    # Closed-form coefficients from train
+                    beta, alpha = self._beta_pair_from_corr(r, sig[y_idx], sig[x_idx], mu[y_idx], mu[x_idx])
+                    # Evaluate R^2
+                    if self.use_split and self.r2_eval == 'test' and X_test is not None:
+                        y_test = X_test[:, y_idx]
+                        x_test = X_test[:, x_idx]
+                        yhat = alpha + beta * x_test
+                        ss_res = ((y_test - yhat) ** 2).sum()
+                        ss_tot = ((y_test - y_test.mean()) ** 2).sum()
+                        r2_eval = 1.0 - ss_res / (ss_tot + 1e-15)
+                    else:
+                        r2_eval = self._r2_from_corr(r)
+                    eq = _format_equation_pair(y_name, beta, alpha, x_name)
+                    candidate = {
+                        'combination_id': combo_id,
+                        'terms': terms,
+                        'target': y_name,
+                        'predictors': (x_name,),
+                        'coef': [beta] if keep_cf else None,
+                        'intercept': alpha,
+                        'r2': float(r2_eval),
+                        'preprocessing': preproc_label,
+                        'equation': eq,
+                    }
+                    candidates.append(candidate)
+                # Pick candidate with larger r2
+                best = max(candidates, key=lambda d: d['r2'] if d['r2'] is not None else -np.inf)
+                # Only after picking, compare r2 to threshold
+                if best['r2'] < threshold:
+                    empty = {
+                        'combination_id': combo_id,
+                        'terms': terms,
+                        'target': None,
+                        'predictors': tuple(terms),
+                        'coef': None,
+                        'intercept': np.nan,
+                        'r2': np.nan,
+                        'preprocessing': preproc_label,
+                        'equation': None,
+                    }
+                    return combo_id, empty
+                return combo_id, best
+
+            # k == 3
+            i, j, k3 = cols
+            # For triplets: evaluate all 3 choices of dependent variable
+            candidates = []
+            # y=i, X=(j,k3)
+            a = C[i, j]; b = C[i, k3]; c = C[j, k3]
+            y_idx, u_idx, v_idx = i, j, k3
+            # Closed-form coefficients
+            b1, b2, alpha = self._beta_triplet_from_corr(
+                a, b, c,
+                sig[y_idx], sig[u_idx], sig[v_idx],
+                mu[y_idx],  mu[u_idx],  mu[v_idx]
+            )
+            # Evaluate R^2
+            if self.use_split and self.r2_eval == 'test' and X_test is not None:
+                y_test = X_test[:, y_idx]
+                xu = X_test[:, u_idx]
+                xv = X_test[:, v_idx]
+                yhat = alpha + b1 * xu + b2 * xv
+                ss_res = ((y_test - yhat) ** 2).sum()
+                ss_tot = ((y_test - y_test.mean()) ** 2).sum()
+                r2_eval = 1.0 - ss_res / (ss_tot + 1e-15)
+            else:
+                r2_eval = self._r2_from_corr(a, b, c)
+            eq = _format_equation_triplet(column_names[y_idx], (b1, b2), alpha, (column_names[u_idx], column_names[v_idx]))
+            candidates.append({
+                'combination_id': combo_id,
+                'terms': terms,
+                'target': column_names[y_idx],
+                'predictors': (column_names[u_idx], column_names[v_idx]),
+                'coef': [b1, b2] if keep_cf else None,
+                'intercept': alpha,
+                'r2': float(r2_eval),
+                'preprocessing': preproc_label,
+                'equation': eq,
+            })
+            # y=j, X=(i,k3)
+            a = C[j, i]; b = C[j, k3]; c = C[i, k3]
+            y_idx, u_idx, v_idx = j, i, k3
+            b1, b2, alpha = self._beta_triplet_from_corr(
+                a, b, c,
+                sig[y_idx], sig[u_idx], sig[v_idx],
+                mu[y_idx],  mu[u_idx],  mu[v_idx]
+            )
+            if self.use_split and self.r2_eval == 'test' and X_test is not None:
+                y_test = X_test[:, y_idx]
+                xu = X_test[:, u_idx]
+                xv = X_test[:, v_idx]
+                yhat = alpha + b1 * xu + b2 * xv
+                ss_res = ((y_test - yhat) ** 2).sum()
+                ss_tot = ((y_test - y_test.mean()) ** 2).sum()
+                r2_eval = 1.0 - ss_res / (ss_tot + 1e-15)
+            else:
+                r2_eval = self._r2_from_corr(a, b, c)
+            eq = _format_equation_triplet(column_names[y_idx], (b1, b2), alpha, (column_names[u_idx], column_names[v_idx]))
+            candidates.append({
+                'combination_id': combo_id,
+                'terms': terms,
+                'target': column_names[y_idx],
+                'predictors': (column_names[u_idx], column_names[v_idx]),
+                'coef': [b1, b2] if keep_cf else None,
+                'intercept': alpha,
+                'r2': float(r2_eval),
+                'preprocessing': preproc_label,
+                'equation': eq,
+            })
+            # y=k3, X=(i,j)
+            a = C[k3, i]; b = C[k3, j]; c = C[i, j]
+            y_idx, u_idx, v_idx = k3, i, j
+            b1, b2, alpha = self._beta_triplet_from_corr(
+                a, b, c,
+                sig[y_idx], sig[u_idx], sig[v_idx],
+                mu[y_idx],  mu[u_idx],  mu[v_idx]
+            )
+            if self.use_split and self.r2_eval == 'test' and X_test is not None:
+                y_test = X_test[:, y_idx]
+                xu = X_test[:, u_idx]
+                xv = X_test[:, v_idx]
+                yhat = alpha + b1 * xu + b2 * xv
+                ss_res = ((y_test - yhat) ** 2).sum()
+                ss_tot = ((y_test - y_test.mean()) ** 2).sum()
+                r2_eval = 1.0 - ss_res / (ss_tot + 1e-15)
+            else:
+                r2_eval = self._r2_from_corr(a, b, c)
+            eq = _format_equation_triplet(column_names[y_idx], (b1, b2), alpha, (column_names[u_idx], column_names[v_idx]))
+            candidates.append({
+                'combination_id': combo_id,
+                'terms': terms,
+                'target': column_names[y_idx],
+                'predictors': (column_names[u_idx], column_names[v_idx]),
+                'coef': [b1, b2] if keep_cf else None,
+                'intercept': alpha,
+                'r2': float(r2_eval),
+                'preprocessing': preproc_label,
+                'equation': eq,
+            })
+            # Pick candidate with largest r2
+            best = max(candidates, key=lambda d: d['r2'] if d['r2'] is not None else -np.inf)
+            if best['r2'] < threshold:
+                empty = {
+                    'combination_id': combo_id,
+                    'terms': terms,
+                    'target': None,
+                    'predictors': tuple(terms),
+                    'coef': None,
+                    'intercept': np.nan,
+                    'r2': np.nan,
+                    'preprocessing': preproc_label,
+                    'equation': None,
+                }
+                return combo_id, empty
+            return combo_id, best
+
+        for chunk in self._combo_chunks(n_cols, self.comb, self.chunk_size):
+            if self.n_jobs is not None and self.n_jobs != 1:
+                # processed branch
+                res_p = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes',
+                                 batch_size=batch_size, max_nbytes=max_nbytes)(
+                    delayed(_process_one_branch)(pair, C_proc, mu_proc, sig_proc, preproc_info, arr_proc_te if self.use_split else None) for pair in chunk
+                )
+                # original branch
+                res_o = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes',
+                                 batch_size=batch_size, max_nbytes=max_nbytes)(
+                    delayed(_process_one_branch)(pair, C_orig, mu_orig, sig_orig, 'None', arr_orig_te if self.use_split else None) for pair in chunk
+                )
+            else:
+                res_p = [ _process_one_branch(pair, C_proc, mu_proc, sig_proc, preproc_info, arr_proc_te if self.use_split else None) for pair in chunk ]
+                res_o = [ _process_one_branch(pair, C_orig, mu_orig, sig_orig, 'None', arr_orig_te if self.use_split else None) for pair in chunk ]
+
+            for combo_id, best in res_p:
+                results_proc_list[combo_id] = best
+                results_proc_dict[combo_id] = best
+            for combo_id, best in res_o:
+                results_orig_list[combo_id] = best
+                results_orig_dict[combo_id] = best
+
+        return (results_orig_list, results_orig_dict), (results_proc_list, results_proc_dict)
+
+    # --------------------- public API ---------------------
+    def run(self, return_df=True):
+        (results_original, results_original_dict), (results_processed, results_processed_dict) = \
+            self._create_combinations_corr_based()
+
+        # Attach to instance
+        self.results_original = results_original
+        self.results_original_dict = results_original_dict
+        self.results_processed = results_processed
+        self.results_processed_dict = results_processed_dict
+
+        if return_df:
+            df_original = pd.DataFrame(results_original)
+            df_processed = pd.DataFrame(results_processed)
+            self.results_original_df = df_original
+            self.results_processed_df = df_processed
+            return (
+                {'original': results_original, 'processed': results_processed},
+                {'original': df_original, 'processed': df_processed}
+            )
+        else:
+            return {'original': results_original, 'processed': results_processed}
+
+    def filter_by_r2(self, threshold: float, n_jobs: int | None = None):
+        """
+        Same semantics as Regression_analysis.filter_by_r2: filter processed-side
+        results by R^2 >= threshold, then select rows with those combination_ids
+        from the original-side table.
+        """
+        if n_jobs is None:
+            n_jobs = self.n_jobs
+        # Ensure results/DataFrames exist
+        if not hasattr(self, 'results_processed') or self.results_processed is None:
+            self.run(return_df=True)
+        df_proc = getattr(self, 'results_processed_df', None)
+        if df_proc is None:
+            df_proc = pd.DataFrame(self.results_processed)
+            self.results_processed_df = df_proc
+        df_orig = getattr(self, 'results_original_df', None)
+        if df_orig is None:
+            df_orig = pd.DataFrame(self.results_original)
+            self.results_original_df = df_orig
+
+        if 'r2' not in df_proc.columns:
+            raise ValueError("results_processed DataFrame does not contain 'r2' column")
+        if 'combination_id' not in df_proc.columns:
+            raise ValueError("results_processed DataFrame does not contain 'combination_id' column")
+        if 'combination_id' not in df_orig.columns:
+            raise ValueError("results_original DataFrame does not contain 'combination_id' column")
+
+        df_proc_filt = df_proc[df_proc['r2'] >= float(threshold)].copy()
+        combo_ids = sorted(df_proc_filt['combination_id'].unique().tolist())
+
+        if n_jobs is not None and n_jobs > 1 and len(df_orig) > 10000:
+            chunks = np.array_split(df_orig, n_jobs)
+            def _filter_chunk(chunk):
+                return chunk[chunk['combination_id'].isin(combo_ids)]
+            parts = Parallel(n_jobs=n_jobs, backend=self.backend, prefer='processes')(
+                delayed(_filter_chunk)(c) for c in chunks
+            )
+            filtered_result = pd.concat(parts, ignore_index=True)
+        else:
+            filtered_result = df_orig[df_orig['combination_id'].isin(combo_ids)].copy()
+        filtered_result = filtered_result.reset_index(drop=True)
+
+        self.filtered_combo_ids = combo_ids
+        self.filtered_processed_df = df_proc_filt.reset_index(drop=True)
+        self.filtered_result = filtered_result
         return filtered_result
