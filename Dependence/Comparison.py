@@ -12,7 +12,7 @@ from dae_finder import PolyFeatureMatrix,sequentialThLin
 import pysindy as ps
 from Basis import OrthogonalLibrary
 #from Multicollinearity import create_combinations_with_stable_svd,filter_combinations_cond
-from Multi import SVD_analysis, Regression_analysis
+from Multi import SVD_analysis, Regression_analysis, Regression_analysis_advanced
 from math import comb as n_choose_k
 from joblib import Parallel, delayed
 
@@ -214,10 +214,11 @@ class Noise_Free_results:
         # Number of combinations
         num_combinations = n_choose_k(num_library_terms, comb)
         #SVD_analyzer = SVD_analysis(candidate_lib,comb)
-        Regression_analyzer = Regression_analysis(candidate_lib,comb)
+        Regression_analyzer = Regression_analysis_advanced(data=candidate_lib,comb=comb,gpu_topk=None,threshold=0.0)
         #comb_processed,comb_original = create_combinations_with_stable_svd(candidate_lib,comb)
         #filtered,_ = filter_combinations_cond(comb_processed,comb_original,threshold=20)
-        filtered = Regression_analyzer.filtered_result
+        #filtered = Regression_analyzer.filtered_result
+        filtered = Regression_analyzer.filter_by_r2(0.95)
         # Number of ill-posed combinations with comb
         num_ill_comb = len(filtered)
 
