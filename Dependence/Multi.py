@@ -14,6 +14,31 @@ from threadpoolctl import threadpool_limits
 import gc
 from math import comb as n_choose_k
 
+# --- Optional GPU (CuPy / PyTorch-MPS/CUDA) support ---
+import importlib
+# CuPy (CUDA on NVIDIA, Linux/Windows only)
+try:
+    cp = importlib.import_module("cupy")  # type: ignore[import-not-found]
+    HAS_CUPY = True
+except Exception:
+    cp = None  # type: ignore[assignment]
+    HAS_CUPY = False
+
+# PyTorch (MPS on Apple Silicon, or CUDA if available)
+try:
+    import torch  # type: ignore
+    _has_mps = getattr(torch.backends, 'mps', None)
+    _mps_ok = bool(_has_mps and torch.backends.mps.is_available())
+    _cuda_ok = torch.cuda.is_available()
+    HAS_TORCH = _mps_ok or _cuda_ok
+    TORCH_DEVICE = (
+        torch.device('mps') if _mps_ok else (torch.device('cuda') if _cuda_ok else torch.device('cpu'))
+    )
+except Exception:
+    torch = None  # type: ignore
+    HAS_TORCH = False
+    TORCH_DEVICE = None
+
 from Basis import normalization, Monomials, OrthogonalLibrary
 
 class SVD_analysis:
@@ -345,36 +370,7 @@ class Regression_analysis:
         else:
             return {'original':results_original, 'preprocessed':results_processed}
 
-    #def filter_by_r2(self, threshold: float, n_jobs: int | None = None):
-        # Default to class-level n_jobs when not provided
-        if n_jobs is None:
-            n_jobs = self.n_jobs
-        # Ensure we have run results and DataFrames
-        if not hasattr(self, 'results_processed') or self.results_processed is None:
-            self.run(return_df=True)
-        # Build processed/original DataFrames if not already present
-        df_proc = getattr(self, 'results_processed_df', None)
-        if df_proc is None:
-            df_proc = pd.DataFrame(self.results_processed)
-            self.results_processed_df = df_proc
-
-        # Basic column checks
-        if 'r2' not in df_proc.columns:
-            raise ValueError("results_processed DataFrame does not contain 'r2' column")
-        if 'combination_id' not in df_proc.columns:
-            raise ValueError("results_processed DataFrame does not contain 'combination_id' column")
-        #if 'combination_id' not in df_orig.columns:
-            #raise ValueError("results_original DataFrame does not contain 'combination_id' column")
-        
-        # Filter processed by R^2 threshold
-        df_proc_filt = df_proc[df_proc['r2'] >= float(threshold)].copy()
-        df_proc_filt = df_proc_filt.reset_index(drop=True)
-
-        self.filtered_combo_ids = sorted(df_proc_filt['combination_id'].unique().tolist())
-        self.filtered_processed_df = df_proc_filt
-        self.filtered_result = df_proc_filt
-
-        return df_proc_filt
+# (old filter_by_r2 removed)
 
     def filter_by_r2(self, threshold: float, n_jobs: int | None = None):
         """
@@ -409,14 +405,41 @@ class Regression_analysis:
         if df_proc is None:
             df_proc = pd.DataFrame(self.results_processed)
             self.results_processed_df = df_proc
+        # Guard: reconstruct processed DataFrame if missing/empty or built from dict-of-dicts
+        if df_proc is None or not isinstance(df_proc, pd.DataFrame) or df_proc.empty or ('r2' not in df_proc.columns and isinstance(getattr(self, 'results_processed', None), (list, dict))):
+            rp = getattr(self, 'results_processed', None)
+            if isinstance(rp, list):
+                df_proc = pd.DataFrame(rp)
+            elif isinstance(rp, dict):
+                df_proc = pd.DataFrame(list(rp.values()))
+            else:
+                df_proc = pd.DataFrame()
+            self.results_processed_df = df_proc
         df_orig = getattr(self, 'results_original_df', None)
         if df_orig is None:
             df_orig = pd.DataFrame(self.results_original)
             self.results_original_df = df_orig
 
+        # If processed results are truly empty, short-circuit with empty outputs
+        rp = getattr(self, 'results_processed', None)
+        processed_is_truly_empty = (
+            df_proc is None or df_proc.empty or (
+                'r2' not in df_proc.columns and (
+                    rp is None or (isinstance(rp, (list, tuple, dict)) and len(rp) == 0)
+                )
+            )
+        )
+        if processed_is_truly_empty:
+            empty_cols = ['combination_id','terms','target','predictors','coef','intercept','r2','preprocessing','equation']
+            empty_df = pd.DataFrame(columns=empty_cols)
+            self.filtered_combo_ids = []
+            self.filtered_processed_df = empty_df.copy()
+            self.filtered_result = empty_df.copy()
+            return empty_df.copy()
+
         # Basic column checks
         if 'r2' not in df_proc.columns:
-            raise ValueError("results_processed DataFrame does not contain 'r2' column")
+            raise ValueError(f"results_processed DataFrame does not contain 'r2' column. Available columns: {list(df_proc.columns)}")
         if 'combination_id' not in df_proc.columns:
             raise ValueError("results_processed DataFrame does not contain 'combination_id' column")
         if 'combination_id' not in df_orig.columns:
@@ -450,6 +473,87 @@ class Regression_analysis:
 
 # --------------------- Fast correlation-matrix-based regression analysis ---------------------
 class Regression_analysis_advanced:
+    def _torch_prescreen_pairs(self, X_train_proc, threshold):
+        """PyTorch prescreen for pairs on processed-train: return np.ndarray [[i,j,r2_train], ...] with i<j.
+        Works on MPS (Apple Silicon) or CUDA if available.
+        """
+        if not HAS_TORCH or TORCH_DEVICE is None:
+            return None
+        import torch
+        X = torch.as_tensor(X_train_proc, device=TORCH_DEVICE, dtype=torch.float32)
+        # Correlation on train
+        mu = X.mean(dim=0, keepdim=True)
+        Xc = X - mu
+        sig = Xc.std(dim=0, unbiased=False)
+        sig = torch.clamp(sig, min=1e-15)
+        Z = Xc / sig
+        C = (Z.T @ Z) / Z.shape[0]
+        C = torch.clamp(C, -1.0, 1.0)
+        C.fill_diagonal_(1.0)
+        R2 = C * C
+        iu, iv = torch.triu_indices(C.shape[0], C.shape[1], offset=1, device=TORCH_DEVICE)
+        r2_vec = R2[iu, iv]
+        mask = r2_vec >= threshold
+        if mask.sum().item() == 0:
+            return np.empty((0, 3), dtype=float)
+        i_sel = iu[mask].to('cpu').numpy()
+        j_sel = iv[mask].to('cpu').numpy()
+        r2_sel = r2_vec[mask].to('cpu').numpy()
+        return np.stack([i_sel, j_sel, r2_sel], axis=1)
+
+    def _torch_prescreen_triplets(self, X_train_proc, threshold, topk=50):
+        """PyTorch prescreen for triplets on processed-train: return np.ndarray [[y,u,v,r2_train], ...].
+        Uses Top-K neighborhood per y; works with MPS/CUDA.
+        """
+        if not HAS_TORCH or TORCH_DEVICE is None:
+            return None
+        import torch
+        X = torch.as_tensor(X_train_proc, device=TORCH_DEVICE, dtype=torch.float32)
+        mu = X.mean(dim=0, keepdim=True)
+        Xc = X - mu
+        sig = Xc.std(dim=0, unbiased=False)
+        sig = torch.clamp(sig, min=1e-15)
+        Z = Xc / sig
+        C = (Z.T @ Z) / Z.shape[0]
+        C = torch.clamp(C, -1.0, 1.0)
+        C.fill_diagonal_(1.0)
+        p = C.shape[0]
+        absC = torch.abs(C)
+        hits = []
+        for y in range(p):
+            # Top-K neighbors excluding y
+            #vals, idx = torch.topk(absC[y], k=min(int(topk) if topk else p-1, p-1))
+            # Remove y if present (topk may include y if topk==p-1)
+            #mask_not_y = idx != y
+            #S = idx[mask_not_y]
+            order = torch.argsort(absC[y], descending=True)
+            order = order[order != y]                 # First, eliminate y.
+            if topk:                                  # topk=None indicates selecting all p-1 neighbors.
+                order = order[:min(int(topk), p-1)]
+            S = order
+            K = S.numel()
+            if K < 2:
+                continue
+            iu, iv = torch.triu_indices(K, K, offset=1, device=TORCH_DEVICE)
+            ryS = C[y, S]  # (K,)
+            a = ryS[:, None]
+            b = ryS[None, :]
+            c = C.index_select(0, S).index_select(1, S)
+            num = a*a + b*b - 2*a*b*c
+            den = torch.clamp(1 - c*c, min=1e-15)
+            R2 = num / den
+            r2_vec = R2[iu, iv]
+            m = r2_vec >= threshold
+            if m.sum().item() == 0:
+                continue
+            u_sel = S[iu[m]].to('cpu').numpy()
+            v_sel = S[iv[m]].to('cpu').numpy()
+            r2_sel = r2_vec[m].to('cpu').numpy()
+            y_col = np.full_like(u_sel, int(y))
+            hits.append(np.stack([y_col, u_sel, v_sel, r2_sel], axis=1))
+        if not hits:
+            return np.empty((0, 4), dtype=float)
+        return np.concatenate(hits, axis=0)
     """
     Fast regression analysis using correlation-matrix closed forms (no per-combo fitting).
 
@@ -490,8 +594,9 @@ class Regression_analysis_advanced:
 
     def __init__(self, data, comb, preprocessing='standardize', threshold=0.95,
                  n_jobs=-1, backend='loky', batch_size=8, max_nbytes='16M',
-                 chunk_size=1000, blas_threads=1, array_dtype='float32',
+                 chunk_size=1000, blas_threads=1, array_dtype='float64',
                  keep_equation=True, keep_coef=True, tie_rule_pairs='larger_var',
+                 use_gpu: bool = True, gpu_topk: int | None = 50,
                  use_split=True, test_size=0.33, random_state=27, r2_eval='test'):
         self.data = data
         self.comb = int(comb)
@@ -509,6 +614,8 @@ class Regression_analysis_advanced:
         self.keep_equation = bool(keep_equation)
         self.keep_coef = bool(keep_coef)
         self.tie_rule_pairs = tie_rule_pairs  # 'larger_var' or 'first'
+        self.use_gpu = bool(use_gpu)
+        self.gpu_topk = None if gpu_topk is None else int(gpu_topk)
         self.use_split = bool(use_split)
         self.test_size = float(test_size)
         self.random_state = random_state
@@ -540,6 +647,23 @@ class Regression_analysis_advanced:
         C = (Z.T @ Z) / Z.shape[0]
         np.fill_diagonal(C, 1.0)
         C = np.clip(C, -1.0, 1.0)
+        return C, mu, sig
+
+    @staticmethod
+    def _corrcoef_xp(X, xp):
+        """Backend-agnostic correlation: returns (C, mu, sig) on the provided xp (np/cp)."""
+        X = xp.asarray(X)
+        mu = X.mean(axis=0)
+        Xc = X - mu
+        sig = Xc.std(axis=0, ddof=0)
+        Z = Xc / xp.maximum(sig, 1e-15)
+        C = (Z.T @ Z) / Z.shape[0]
+        if xp is np:
+            np.fill_diagonal(C, 1.0)
+            C = np.clip(C, -1.0, 1.0)
+        else:
+            cp.fill_diagonal(C, 1.0)
+            C = cp.clip(C, -1.0, 1.0)
         return C, mu, sig
 
     @staticmethod
@@ -579,6 +703,58 @@ class Regression_analysis_advanced:
         b2 = b2_std * (sig_y / (sig_v + 1e-15))
         alpha = mu_y - (b1 * mu_u + b2 * mu_v)
         return float(b1), float(b2), float(alpha)
+
+    def _gpu_prescreen_pairs(self, X_train_proc, threshold):
+        """GPU prescreen for pairs on processed-train: return np.ndarray [[i,j,r2_train], ...] with i<j."""
+        if not HAS_CUPY:
+            return None
+        xp = cp
+        C, _, _ = self._corrcoef_xp(X_train_proc, xp)
+        R2 = C * C  # elementwise square
+        # Only take upper triangle (i<j)
+        iu, iv = xp.triu_indices(R2.shape[0], k=1)
+        r2_vec = R2[iu, iv]
+        mask = r2_vec >= threshold
+        if not bool(mask.any()):
+            return np.empty((0, 3), dtype=float)
+        out = xp.stack([iu[mask], iv[mask], r2_vec[mask]], axis=1)
+        return cp.asnumpy(out)
+
+    def _gpu_prescreen_triplets(self, X_train_proc, threshold, topk=50):
+        """GPU prescreen for triplets on processed-train: return np.ndarray [[y,u,v,r2_train], ...] with u<v and all in neigh[y]."""
+        if not HAS_CUPY:
+            return None
+        xp = cp
+        C, _, _ = self._corrcoef_xp(X_train_proc, xp)
+        p = C.shape[0]
+        absC = xp.abs(C)
+        hits = []
+        for y in range(p):
+            order = xp.argsort(absC[y])[::-1]
+            S = order[order != y][:min(topk or (p-1), p-1)]
+            K = S.size
+            if K < 2:
+                continue
+            iu, iv = xp.triu_indices(K, k=1)
+            ryS = C[y, S]            # (K,)
+            a = ryS[:, None]
+            b = ryS[None, :]
+            c = C[S[:, None], S[None, :]]
+            num = a*a + b*b - 2*a*b*c
+            den = xp.maximum(1 - c*c, 1e-15)
+            R2 = num / den
+            r2_vec = R2[iu, iv]
+            mask = r2_vec >= threshold
+            if not bool(mask.any()):
+                continue
+            u_sel = S[iu[mask]]
+            v_sel = S[iv[mask]]
+            r2_sel = r2_vec[mask]
+            hits.append(xp.stack([xp.full_like(u_sel, y), u_sel, v_sel, r2_sel], axis=1))
+        if not hits:
+            return np.empty((0, 4), dtype=float)
+        gpu_arr = xp.concatenate(hits, axis=0)
+        return cp.asnumpy(gpu_arr)
 
     @staticmethod
     def _combo_chunks(n_features, k, chunk_size):
@@ -633,10 +809,12 @@ class Regression_analysis_advanced:
 
         k = self.comb
         n_total = n_choose_k(n_cols, k)
-        results_orig_list = [None] * n_total
-        results_orig_dict = {}
+        # Processed: keep full size (我们会计算全部组合)
         results_proc_list = [None] * n_total
         results_proc_dict = {}
+        # Original: 按需回填（只为命中组合计算，不预分配）
+        results_orig_list = []
+        results_orig_dict = {}
 
         # local shortcuts to avoid pickling self
         tie_rule_pairs = self.tie_rule_pairs
@@ -647,6 +825,254 @@ class Regression_analysis_advanced:
         batch_size = self.batch_size
         max_nbytes = self.max_nbytes
         n_jobs = self.n_jobs
+
+
+        def _format_equation_pair(target_name, beta, intercept, feat_name):
+            if not keep_eq:
+                return None
+            rhs = f"{beta:+.6g}*{feat_name}"
+            if abs(intercept) > 1e-12:
+                rhs += f" {intercept:+.6g}"
+            # strip leading '+'
+            rhs = rhs.lstrip()
+            return f"{target_name} = {rhs}"
+
+        def _format_equation_triplet(target_name, coef_tuple, intercept, feat_names):
+            if not keep_eq:
+                return None
+            parts = []
+            for c, fn in zip(coef_tuple, feat_names):
+                if abs(c) < 1e-12:
+                    continue
+                parts.append(f" {c:+.6g}*{fn}")
+            rhs = '0' if not parts else ''.join(parts)
+            if abs(intercept) > 1e-12:
+                rhs += f" {intercept:+.6g}"
+            rhs = rhs.strip()
+            return f"{target_name} = {rhs}"
+
+        def _process_one_branch(pair, C, mu, sig, preproc_label, X_test=None):
+            combo_id, idx_tuple = pair
+            cols = list(idx_tuple)
+            terms = tuple(column_names[i] for i in cols)
+
+            if k == 2:
+                i, j = cols
+                # For pairs: evaluate both choices of dependent variable
+                candidates = []
+                for (y_idx, x_idx) in [(i, j), (j, i)]:
+                    y_name = column_names[y_idx]
+                    x_name = column_names[x_idx]
+                    r = C[y_idx, x_idx]
+                    # Closed-form coefficients from train
+                    beta, alpha = self._beta_pair_from_corr(r, sig[y_idx], sig[x_idx], mu[y_idx], mu[x_idx])
+                    # Evaluate R^2
+                    if self.use_split and self.r2_eval == 'test' and X_test is not None:
+                        y_test = X_test[:, y_idx]
+                        x_test = X_test[:, x_idx]
+                        yhat = alpha + beta * x_test
+                        resid = y_test - yhat
+                        ss_res = np.sum(resid * resid, dtype=np.float64)
+                        center = y_test - np.mean(y_test)
+                        ss_tot = np.sum(center * center, dtype=np.float64)
+                        r2_eval = 1.0 - ss_res / (ss_tot + 1e-15)
+                    else:
+                        r2_eval = self._r2_from_corr(r)
+                    eq = _format_equation_pair(y_name, beta, alpha, x_name)
+                    candidate = {
+                        'combination_id': combo_id,
+                        'terms': terms,
+                        'target': y_name,
+                        'predictors': (x_name,),
+                        'coef': [beta] if keep_cf else None,
+                        'intercept': alpha,
+                        'r2': float(r2_eval),
+                        'preprocessing': preproc_label,
+                        'equation': eq,
+                    }
+                    candidates.append(candidate)
+                # Pick candidate with larger r2
+                best = max(candidates, key=lambda d: d['r2'] if d['r2'] is not None else -np.inf)
+                # Only after picking, compare r2 to threshold
+                if best['r2'] < threshold:
+                    empty = {
+                        'combination_id': combo_id,
+                        'terms': terms,
+                        'target': None,
+                        'predictors': tuple(terms),
+                        'coef': None,
+                        'intercept': np.nan,
+                        'r2': np.nan,
+                        'preprocessing': preproc_label,
+                        'equation': None,
+                    }
+                    return combo_id, empty
+                return combo_id, best
+
+            # k == 3
+            i, j, k3 = cols
+            # For triplets: evaluate all 3 choices of dependent variable
+            candidates = []
+            # y=i, X=(j,k3)
+            a = C[i, j]; b = C[i, k3]; c = C[j, k3]
+            y_idx, u_idx, v_idx = i, j, k3
+            # Closed-form coefficients
+            b1, b2, alpha = self._beta_triplet_from_corr(
+                a, b, c,
+                sig[y_idx], sig[u_idx], sig[v_idx],
+                mu[y_idx],  mu[u_idx],  mu[v_idx]
+            )
+            # Evaluate R^2
+            if self.use_split and self.r2_eval == 'test' and X_test is not None:
+                y_test = X_test[:, y_idx]
+                xu = X_test[:, u_idx]
+                xv = X_test[:, v_idx]
+                yhat = alpha + b1 * xu + b2 * xv
+                resid = y_test - yhat
+                ss_res = np.sum(resid * resid, dtype=np.float64)
+                center = y_test - np.mean(y_test)
+                ss_tot = np.sum(center * center, dtype=np.float64)
+                r2_eval = 1.0 - ss_res / (ss_tot + 1e-15)
+            else:
+                r2_eval = self._r2_from_corr(a, b, c)
+            eq = _format_equation_triplet(column_names[y_idx], (b1, b2), alpha, (column_names[u_idx], column_names[v_idx]))
+            candidates.append({
+                'combination_id': combo_id,
+                'terms': terms,
+                'target': column_names[y_idx],
+                'predictors': (column_names[u_idx], column_names[v_idx]),
+                'coef': [b1, b2] if keep_cf else None,
+                'intercept': alpha,
+                'r2': float(r2_eval),
+                'preprocessing': preproc_label,
+                'equation': eq,
+            })
+            # y=j, X=(i,k3)
+            a = C[j, i]; b = C[j, k3]; c = C[i, k3]
+            y_idx, u_idx, v_idx = j, i, k3
+            b1, b2, alpha = self._beta_triplet_from_corr(
+                a, b, c,
+                sig[y_idx], sig[u_idx], sig[v_idx],
+                mu[y_idx],  mu[u_idx],  mu[v_idx]
+            )
+            if self.use_split and self.r2_eval == 'test' and X_test is not None:
+                y_test = X_test[:, y_idx]
+                xu = X_test[:, u_idx]
+                xv = X_test[:, v_idx]
+                yhat = alpha + b1 * xu + b2 * xv
+                resid = y_test - yhat
+                ss_res = np.sum(resid * resid, dtype=np.float64)
+                center = y_test - np.mean(y_test)
+                ss_tot = np.sum(center * center, dtype=np.float64)
+                r2_eval = 1.0 - ss_res / (ss_tot + 1e-15)
+            else:
+                r2_eval = self._r2_from_corr(a, b, c)
+            eq = _format_equation_triplet(column_names[y_idx], (b1, b2), alpha, (column_names[u_idx], column_names[v_idx]))
+            candidates.append({
+                'combination_id': combo_id,
+                'terms': terms,
+                'target': column_names[y_idx],
+                'predictors': (column_names[u_idx], column_names[v_idx]),
+                'coef': [b1, b2] if keep_cf else None,
+                'intercept': alpha,
+                'r2': float(r2_eval),
+                'preprocessing': preproc_label,
+                'equation': eq,
+            })
+            # y=k3, X=(i,j)
+            a = C[k3, i]; b = C[k3, j]; c = C[i, j]
+            y_idx, u_idx, v_idx = k3, i, j
+            b1, b2, alpha = self._beta_triplet_from_corr(
+                a, b, c,
+                sig[y_idx], sig[u_idx], sig[v_idx],
+                mu[y_idx],  mu[u_idx],  mu[v_idx]
+            )
+            if self.use_split and self.r2_eval == 'test' and X_test is not None:
+                y_test = X_test[:, y_idx]
+                xu = X_test[:, u_idx]
+                xv = X_test[:, v_idx]
+                yhat = alpha + b1 * xu + b2 * xv
+                resid = y_test - yhat
+                ss_res = np.sum(resid * resid, dtype=np.float64)
+                center = y_test - np.mean(y_test)
+                ss_tot = np.sum(center * center, dtype=np.float64)
+                r2_eval = 1.0 - ss_res / (ss_tot + 1e-15)
+            else:
+                r2_eval = self._r2_from_corr(a, b, c)
+            eq = _format_equation_triplet(column_names[y_idx], (b1, b2), alpha, (column_names[u_idx], column_names[v_idx]))
+            candidates.append({
+                'combination_id': combo_id,
+                'terms': terms,
+                'target': column_names[y_idx],
+                'predictors': (column_names[u_idx], column_names[v_idx]),
+                'coef': [b1, b2] if keep_cf else None,
+                'intercept': alpha,
+                'r2': float(r2_eval),
+                'preprocessing': preproc_label,
+                'equation': eq,
+            })
+            # Pick candidate with largest r2
+            best = max(candidates, key=lambda d: d['r2'] if d['r2'] is not None else -np.inf)
+            if best['r2'] < threshold:
+                empty = {
+                    'combination_id': combo_id,
+                    'terms': terms,
+                    'target': None,
+                    'predictors': tuple(terms),
+                    'coef': None,
+                    'intercept': np.nan,
+                    'r2': np.nan,
+                    'preprocessing': preproc_label,
+                    'equation': None,
+                }
+                return combo_id, empty
+            return combo_id, best
+
+        # Optional GPU/Torch prescreen: compute only for combos likely to pass threshold on processed branch
+        if self.use_gpu and (HAS_CUPY or HAS_TORCH):
+            selected_pairs = []  # sequence of (combo_id, idx_tuple)
+            if k == 2:
+                hits = None
+                if HAS_CUPY:
+                    hits = self._gpu_prescreen_pairs(arr_proc_tr if self.use_split else arr_proc, threshold)
+                if (hits is None or (isinstance(hits, np.ndarray) and hits.size == 0)) and HAS_TORCH:
+                    hits = self._torch_prescreen_pairs(arr_proc_tr if self.use_split else arr_proc, threshold)
+                hits = hits if hits is not None else np.empty((0, 3), dtype=float)
+                for cid, (i, j, r2t) in enumerate(hits):
+                    selected_pairs.append((int(cid), (int(i), int(j))))
+            elif k == 3:
+                hits = None
+                if HAS_CUPY:
+                    hits = self._gpu_prescreen_triplets(arr_proc_tr if self.use_split else arr_proc, threshold, topk=self.gpu_topk)
+                if (hits is None or (isinstance(hits, np.ndarray) and hits.size == 0)) and HAS_TORCH:
+                    hits = self._torch_prescreen_triplets(arr_proc_tr if self.use_split else arr_proc, threshold, topk=self.gpu_topk)
+                hits = hits if hits is not None else np.empty((0, 4), dtype=float)
+                # Deduplicate by sorted (i,j,k)
+                seen = {}
+                for row in hits:
+                    y, u, v = map(int, row[:3])
+                    key = tuple(sorted((y, u, v)))
+                    if key not in seen:
+                        seen[key] = True
+                for cid, key in enumerate(seen.keys()):
+                    selected_pairs.append((int(cid), key))
+            # Build processed results ONLY for selected_pairs using CPU helper (with test-R2 if configured)
+            results_proc_list = []
+            results_proc_dict = {}
+            for pair in selected_pairs:
+                combo_id, best = _process_one_branch(pair, C_proc, mu_proc, sig_proc, preproc_info,
+                                                     arr_proc_te if self.use_split else None)
+                results_proc_list.append(best)
+                results_proc_dict[combo_id] = best
+            # Stage B: original on demand for selected only
+            results_orig_list = []
+            results_orig_dict = {}
+            for pair in selected_pairs:
+                combo_id, best = _process_one_branch(pair, C_orig, mu_orig, sig_orig, 'None',
+                                                     arr_orig_te if self.use_split else None)
+                results_orig_list.append(best)
+                results_orig_dict[combo_id] = best
+            return (results_orig_list, results_orig_dict), (results_proc_list, results_proc_dict)
 
         def _format_equation_pair(target_name, beta, intercept, feat_name):
             if not keep_eq:
@@ -841,28 +1267,59 @@ class Regression_analysis_advanced:
                 return combo_id, empty
             return combo_id, best
 
+        # ========== Stage A: processed only, collect pass-list ==========
+        selected_pairs = []  # list of (combo_id, idx_tuple) for combos passing threshold
         for chunk in self._combo_chunks(n_cols, self.comb, self.chunk_size):
+            # Establish a mapping between block IDs and combinations to facilitate recording passed idx_tuple entries.
+            id2combo = {cid: cmb for (cid, cmb) in chunk}
+
             if self.n_jobs is not None and self.n_jobs != 1:
-                # processed branch
                 res_p = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes',
                                  batch_size=batch_size, max_nbytes=max_nbytes)(
-                    delayed(_process_one_branch)(pair, C_proc, mu_proc, sig_proc, preproc_info, arr_proc_te if self.use_split else None) for pair in chunk
-                )
-                # original branch
-                res_o = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes',
-                                 batch_size=batch_size, max_nbytes=max_nbytes)(
-                    delayed(_process_one_branch)(pair, C_orig, mu_orig, sig_orig, 'None', arr_orig_te if self.use_split else None) for pair in chunk
+                    delayed(_process_one_branch)(pair, C_proc, mu_proc, sig_proc, preproc_info,
+                                                 arr_proc_te if self.use_split else None)
+                    for pair in chunk
                 )
             else:
-                res_p = [ _process_one_branch(pair, C_proc, mu_proc, sig_proc, preproc_info, arr_proc_te if self.use_split else None) for pair in chunk ]
-                res_o = [ _process_one_branch(pair, C_orig, mu_orig, sig_orig, 'None', arr_orig_te if self.use_split else None) for pair in chunk ]
+                res_p = [
+                    _process_one_branch(pair, C_proc, mu_proc, sig_proc, preproc_info,
+                                         arr_proc_te if self.use_split else None)
+                    for pair in chunk
+                ]
 
+            # Write the processed results and record combinations that pass the threshold (saving their idx_tuple).
             for combo_id, best in res_p:
                 results_proc_list[combo_id] = best
                 results_proc_dict[combo_id] = best
-            for combo_id, best in res_o:
-                results_orig_list[combo_id] = best
-                results_orig_dict[combo_id] = best
+                r2v = best.get('r2', np.nan)
+                if np.isfinite(r2v) and r2v >= threshold:
+                    selected_pairs.append((combo_id, id2combo[combo_id]))
+
+        # ========== Stage B: original on demand (only selected combos) ==========
+        if selected_pairs:
+            # Process selected combinations in batches to avoid submitting too many tasks at once.
+            def _chunk_pairs(pairs, size):
+                for i in range(0, len(pairs), size):
+                    yield pairs[i:i+size]
+
+            for sel_chunk in _chunk_pairs(selected_pairs, self.chunk_size):
+                if self.n_jobs is not None and self.n_jobs != 1:
+                    res_o = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes',
+                                     batch_size=batch_size, max_nbytes=max_nbytes)(
+                        delayed(_process_one_branch)(pair, C_orig, mu_orig, sig_orig, 'None',
+                                                     arr_orig_te if self.use_split else None)
+                        for pair in sel_chunk
+                    )
+                else:
+                    res_o = [
+                        _process_one_branch(pair, C_orig, mu_orig, sig_orig, 'None',
+                                            arr_orig_te if self.use_split else None)
+                        for pair in sel_chunk
+                    ]
+                for combo_id, best in res_o:
+                    results_orig_list.append(best)
+                    results_orig_dict[combo_id] = best
+        # If there are no matches, the original branch remains an empty list/empty dictionary.
 
         return (results_orig_list, results_orig_dict), (results_proc_list, results_proc_dict)
 
@@ -904,13 +1361,40 @@ class Regression_analysis_advanced:
         if df_proc is None:
             df_proc = pd.DataFrame(self.results_processed)
             self.results_processed_df = df_proc
+        # Guard: reconstruct processed DataFrame if missing/empty or built from dict-of-dicts
+        if df_proc is None or not isinstance(df_proc, pd.DataFrame) or df_proc.empty or ('r2' not in df_proc.columns and isinstance(getattr(self, 'results_processed', None), (list, dict))):
+            rp = getattr(self, 'results_processed', None)
+            if isinstance(rp, list):
+                df_proc = pd.DataFrame(rp)
+            elif isinstance(rp, dict):
+                df_proc = pd.DataFrame(list(rp.values()))
+            else:
+                df_proc = pd.DataFrame()
+            self.results_processed_df = df_proc
         df_orig = getattr(self, 'results_original_df', None)
         if df_orig is None:
             df_orig = pd.DataFrame(self.results_original)
             self.results_original_df = df_orig
 
+        # If processed results are truly empty, short-circuit with empty outputs
+        rp = getattr(self, 'results_processed', None)
+        processed_is_truly_empty = (
+            df_proc is None or df_proc.empty or (
+                'r2' not in df_proc.columns and (
+                    rp is None or (isinstance(rp, (list, tuple, dict)) and len(rp) == 0)
+                )
+            )
+        )
+        if processed_is_truly_empty:
+            empty_cols = ['combination_id','terms','target','predictors','coef','intercept','r2','preprocessing','equation']
+            empty_df = pd.DataFrame(columns=empty_cols)
+            self.filtered_combo_ids = []
+            self.filtered_processed_df = empty_df.copy()
+            self.filtered_result = empty_df.copy()
+            return empty_df.copy()
+
         if 'r2' not in df_proc.columns:
-            raise ValueError("results_processed DataFrame does not contain 'r2' column")
+            raise ValueError(f"results_processed DataFrame does not contain 'r2' column. Available columns: {list(df_proc.columns)}")
         if 'combination_id' not in df_proc.columns:
             raise ValueError("results_processed DataFrame does not contain 'combination_id' column")
         if 'combination_id' not in df_orig.columns:
