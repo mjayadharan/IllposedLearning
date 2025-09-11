@@ -213,44 +213,68 @@ class sampling:
                      filename_prefix="IC"):
         out_dir, tag = self._prepare_outdir(out_path, n_step, filename_prefix)
         rr = te.loadSBMLModel(sbml_path)
-        species_ids = list(rr.model.getFloatingSpeciesIds())
+        # Use floating species IDs as the dynamic states (strings only)
+        species_ids = [str(s) for s in rr.model.getFloatingSpeciesIds()]
         self.ID = species_ids
-        self.sample_orig.columns = species_ids
-        ic_df = self.sample_orig.reindex(columns=species_ids).copy()
-        rr.timeCourseSelections = ['time'] + species_ids
+
+        # Build IC table aligned *positionally* to the species order to avoid label mismatches
+        if len(self.sample_orig.columns) != len(species_ids):
+            raise ValueError(
+                f"Column mismatch: {len(self.sample_orig.columns)} columns vs {len(species_ids)} species (IDs: {species_ids})."
+                " Make sure your input data has the same number of state columns as floating species."
+            )
+        ic_df = self.sample_orig.copy()
+        # Ensure exact order and names match species_ids
+        ic_df.columns = species_ids
+
+        # Selections: time plus species states (use concentration syntax [S])
+        species_selections = [f'[{s}]' for s in species_ids]
+        rr.timeCourseSelections = ['time'] + species_selections
 
         # Load parameters dictionary
         param_dict = {}
         for param in rr.model.getGlobalParameterIds():
             val = rr.model[param]
             param_dict[param] = val
-        # align columns to model species order; missing columns become NaN
-        ic_df = self.sample_orig
 
         filepaths = []
         # ensure integer number of points and include both endpoints (step=5 in the Beer model)
         for k in range(len(ic_df)):
-            row = ic_df.iloc[k]
-            for j, s in enumerate(species_ids):
-                val = row[s]
-                if not pd.isna(val):
-                    v = float(val)
-                    rr[f'init({s})'] = v
+            # Initialize by position to avoid label KeyError
+            vals = ic_df.iloc[k].to_numpy()
+            for s, v in zip(species_ids, vals):
+                if np.isfinite(v):
+                    rr[f'init({s})'] = float(v)
 
             rr.reset()
             res = rr.simulate(start, end, n_step)
             df = pd.DataFrame(res, columns=rr.timeCourseSelections)
 
+            # Rename [S] -> S for consistency
+            rename_map = {f'[{s}]': s for s in species_ids}
+            df = df.rename(columns=rename_map)
+
+            # Sanity check: ensure all species columns are present
+            missing_cols = [s for s in species_ids if s not in df.columns]
+            if missing_cols:
+                raise KeyError(
+                    f"simulate() did not return requested species columns: {missing_cols}. "
+                    f"Selections were: {rr.timeCourseSelections}"
+                )
+
+            # Compute rates by setting states in the same positional order
             rates_list = []
             for t in range(len(df)):
-                for j, s in enumerate(species_ids):
-                    rr[s] = df.loc[t, s]
+                state_vals = df.loc[t, species_ids].to_numpy()
+                for s, v in zip(species_ids, state_vals):
+                    rr[s] = float(v)
                 rates = rr.getRatesOfChange()
                 rates_list.append(rates)
 
             derivative_df = pd.DataFrame(rates_list, columns=[f'd{s}/dt' for s in species_ids])
             data_augmented = pd.concat([df, derivative_df], axis=1)
 
+            # Save
             fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
             data_augmented.to_excel(fp, index=False)
             filepaths.append(fp)
@@ -408,6 +432,7 @@ class sampling:
         """
         # Load and concatenate every trajectory dataframe
         dfs = [pd.read_excel(fp) for fp in filepaths]
+        print("Subsample input columns:", dfs[0].columns.tolist())
         data = pd.concat(dfs, ignore_index=True)
 
         X = data[self.ID]
