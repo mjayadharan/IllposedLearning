@@ -35,7 +35,7 @@ def standardize_columns(df,time_col=None):
     for idx, col in enumerate(var_cols, start=1):
         if not re.fullmatch(r"x\d+", str(col)):
             new_names[col] = f"x{idx}"
-    return df.rename(columns=new_names),time_col
+    return df.rename(columns=new_names),time_col[0] if isinstance(time_col, list) else time_col
 
 def target_relationship(data,target_col,test_size=0.2,fit_with_intercept=False):
     """
@@ -214,7 +214,8 @@ class Noise_Free_results:
         # Number of combinations
         num_combinations = n_choose_k(num_library_terms, comb)
         #SVD_analyzer = SVD_analysis(candidate_lib,comb)
-        Regression_analyzer = Regression_analysis_advanced(data=candidate_lib,comb=comb,gpu_topk=None,threshold=0.0)
+        Regression_analyzer = Regression_analysis(data=candidate_lib,comb=comb,threshold=0.95)
+        #Regression_analyzer = Regression_analysis_advanced(data=candidate_lib,comb=comb,gpu_topk=None,threshold=0.00)
         #comb_processed,comb_original = create_combinations_with_stable_svd(candidate_lib,comb)
         #filtered,_ = filter_combinations_cond(comb_processed,comb_original,threshold=20)
         #filtered = Regression_analyzer.filtered_result
@@ -1272,7 +1273,11 @@ class Terms_Analysis:
                     parts = t.strip().split()
                     parts_sorted = sorted(parts, key=_xi_index)
                     canon_terms.append(' '.join(parts_sorted))
-            data = preprocess_for_stable(self.data[canon_terms],'standarize')[0]
+            data = preprocess_for_stable(self.data[canon_terms], 'standarize')[0]
+            if data.shape[1] == 0 or data.shape[0] == 0:
+                print(f"{feature}: no wrong terms or missing terms, skipping SVD.")
+                con_number[feature] = {'Condition Number': 0}
+                continue
             U, s, Vt = np.linalg.svd(data, full_matrices=False)
             condition_number = s[0] / s[-1]
             con_number[feature] = {'Condition Number': condition_number}
