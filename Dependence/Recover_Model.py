@@ -116,15 +116,16 @@ class Recover_Model_sindy:
         dt = t[1] - t[0]
         
         if self.Xdot is None:
-            X_dot = np.gradient(X,t,axis=0,edge_order=self.differential_order)
+            differential_method = ps.FiniteDifference(self.differential_order)
+            #X_dot = np.gradient(X,t,axis=0,edge_order=self.differential_order)
             model = ps.SINDy(
-                #differentiation_method=differential_method,
+                differentiation_method=differential_method,
                 feature_library = feature_library,
                 optimizer = optimizer,
                 feature_names = feature_names
             )
             self.model = model
-            model.fit(X,t=t,x_dot=X_dot)
+            model.fit(X,t=t)
             #model.fit(self.data_states,t = self.time)
         else:
             model = ps.SINDy(
@@ -198,12 +199,10 @@ class Recover_Model_sindy:
         This version fits a fresh model for each threshold and computes scores immediately,
         avoiding the fragile pattern of reusing a single optimizer/model afterward.
         """
-        import numpy as _np
-        import matplotlib.pyplot as _plt
         from sklearn.metrics import mean_squared_error as _mse
 
         # Train/test split on index (no shuffle to preserve time ordering)
-        indices = _np.arange(len(self.data_states))
+        indices = np.arange(len(self.data_states))
         train_indices, test_indices = train_test_split(
             indices, test_size=0.33, random_state=27, shuffle=False
         )
@@ -217,19 +216,19 @@ class Recover_Model_sindy:
 
         # Prepare X / Xdot on the appropriate space
         if method == 'Monomial':
-            X_all = _np.asarray(self.data_states, dtype=_np.float64)
+            X_all = np.asarray(self.data_states, dtype=np.float64)
             if self.Xdot is None:
-                Xdot_all = _np.gradient(X_all, t, axis=0, edge_order=self.differential_order)
+                Xdot_all = np.gradient(X_all, t, axis=0, edge_order=self.differential_order)
             else:
-                Xdot_all = _np.asarray(self.Xdot, dtype=_np.float64)
+                Xdot_all = np.asarray(self.Xdot, dtype=np.float64)
             X_train, X_test = X_all[train_indices], X_all[test_indices]
             Xdot_train, Xdot_test = Xdot_all[train_indices], Xdot_all[test_indices]
             feature_library = ps.PolynomialLibrary(self.poly_degree, include_bias=False)
         elif method in ('Chebyshev', 'Legendre'):
             # Use normalized data for orthogonal libraries
-            X_all = _np.asarray(self.data_norm, dtype=_np.float64)
+            X_all = np.asarray(self.data_norm, dtype=np.float64)
             # For fair scoring, compute derivative in the same normalized space
-            Xdot_all = _np.gradient(X_all, t, axis=0, edge_order=self.differential_order)
+            Xdot_all = np.gradient(X_all, t, axis=0, edge_order=self.differential_order)
             X_train, X_test = X_all[train_indices], X_all[test_indices]
             Xdot_train, Xdot_test = Xdot_all[train_indices], Xdot_all[test_indices]
             feature_library = OrthogonalLibrary(degree=self.poly_degree, method=method)
@@ -237,8 +236,8 @@ class Recover_Model_sindy:
             raise ValueError(f"Unknown method: {method}")
 
         thresholds = self.threshold_scan if self.threshold_scan is not None else [self.threshold]
-        mse_deriv = _np.zeros(len(thresholds))
-        mse_traj = _np.zeros(len(thresholds))
+        mse_deriv = np.zeros(len(thresholds))
+        mse_traj = np.zeros(len(thresholds))
 
         for k, thr in enumerate(thresholds):
             optimizer = ps.STLSQ(threshold=thr)
@@ -256,37 +255,37 @@ class Recover_Model_sindy:
             except Exception:
                 # If score fails (shape mismatch, etc.), fall back to manual MSE
                 Xdot_pred = model.predict(X_test)
-                mse_deriv[k] = _np.mean((Xdot_test - Xdot_pred) ** 2)
+                mse_deriv[k] = np.mean((Xdot_test - Xdot_pred) ** 2)
 
             # 2) Trajectory-domain error on test set via simulate
             try:
                 x0 = X_test[0]
                 X_sim = model.simulate(x0, t_test, integrator="odeint")
                 # If simulate explodes, clip to avoid NaNs in MSE
-                if _np.any(~_np.isfinite(X_sim)) or _np.any(_np.abs(X_sim) > 1e6):
-                    X_sim = _np.clip(X_sim, -1e6, 1e6)
-                mse_traj[k] = _np.mean((X_test - X_sim) ** 2)
+                if np.any(~np.isfinite(X_sim)) or np.any(np.abs(X_sim) > 1e6):
+                    X_sim = np.clip(X_sim, -1e6, 1e6)
+                mse_traj[k] = np.mean((X_test - X_sim) ** 2)
             except Exception:
-                mse_traj[k] = _np.nan
+                mse_traj[k] = np.nan
 
         # Plot (do not rely on external helper)
-        _plt.figure()
-        _plt.semilogy(thresholds, mse_deriv, "o-", label=r"$\dot{X}$ RMSE")
-        _plt.xlabel(r"$\lambda$")
-        _plt.xticks(thresholds, [f"{v:.1e}" for v in thresholds])
-        _plt.ylabel(r"Error")
-        _plt.title("Derivative-domain error vs threshold")
-        _plt.grid(True, alpha=0.3)
-        _plt.tight_layout()
+        plt.figure()
+        plt.semilogy(thresholds, mse_deriv, "o-", label=r"$\dot{X}$ RMSE")
+        plt.xlabel(r"$\lambda$")
+        plt.xticks(thresholds, [f"{v:.1e}" for v in thresholds])
+        plt.ylabel(r"Error")
+        plt.title("Derivative-domain error vs threshold")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
 
-        _plt.figure()
-        _plt.semilogy(thresholds, mse_traj, "o-", label="Trajectory RMSE")
-        _plt.xlabel(r"$\lambda$")
-        _plt.ylabel("Error")
-        _plt.xticks(thresholds, [f"{v:.1e}" for v in thresholds])
-        _plt.title("Trajectory-domain error vs threshold")
-        _plt.grid(True, alpha=0.3)
-        _plt.tight_layout()
+        plt.figure()
+        plt.semilogy(thresholds, mse_traj, "o-", label="Trajectory RMSE")
+        plt.xlabel(r"$\lambda$")
+        plt.ylabel("Error")
+        plt.xticks(thresholds, [f"{v:.1e}" for v in thresholds])
+        plt.title("Trajectory-domain error vs threshold")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
 
         return thresholds, mse_deriv, mse_traj
     
