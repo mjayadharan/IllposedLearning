@@ -104,6 +104,31 @@ def fps_indices(X,M,seed=0):
                           )
     return chosen
 
+# Helper: safely widen degenerate bounds for uniform/arcsine sampling
+def _widen_bounds(L, U, min_span=1e-6, frac=0.05):
+    """
+    If a column has U - L ≈ 0 (degenerate in the source data), expand it slightly so
+    that sampling does not collapse to a constant. The expansion is centered at the
+    observed value and uses the larger of:
+      - an absolute floor `min_span`
+      - a fraction `frac` of a scale (|center| or 1.0 if near zero).
+    L, U: pandas Series (one per column)
+    Returns widened (Lw, Uw) as pandas Series with the same index.
+    """
+    import numpy as _np
+    L_arr = _np.asarray(L, dtype=float).copy()
+    U_arr = _np.asarray(U, dtype=float).copy()
+    for i, (l, u) in enumerate(zip(L_arr, U_arr)):
+        # If not finite or non-increasing, or span too small, widen
+        bad = (not _np.isfinite(l)) or (not _np.isfinite(u)) or (u - l) <= 0
+        span = u - l if _np.isfinite(u - l) else 0.0
+        if bad or span < max(min_span, frac * max(1.0, abs(0.5 * (l + u)))):
+            center = 0.5 * (l + u) if _np.isfinite(l) and _np.isfinite(u) else (l if _np.isfinite(l) else (u if _np.isfinite(u) else 0.0))
+            target_span = max(min_span, frac * max(1.0, abs(center)))
+            L_arr[i] = center - 0.5 * target_span
+            U_arr[i] = center + 0.5 * target_span
+    return pd.Series(L_arr, index=L.index), pd.Series(U_arr, index=U.index)
+
 class create_initial_conditions:
     """
     This class creates a group of initial conditions.
@@ -131,48 +156,44 @@ class create_initial_conditions:
 
     def _uniformly_sample(self):
         L_orig, U_orig = self.data_states.min(), self.data_states.max()
-        L_norm, U_norm = self.data_norm.min(), self.data_norm.max()
-        """
-        # Initial conditions in the form of num * n_features
-        random_initial_original = np.random.uniform(low=L_orig, high=U_orig, size=(self.num,self.n_features))
-        random_initial_normalized = np.random.uniform(low=L_norm, high=U_norm, size=(self.num,self.n_features))
-        """
         cols = self.data_states.columns.tolist()
         d = len(cols)
+
         # Sobol + random shift in [0,1]^d
-        u01 = sobol_u01(self.num,d=d,seed=0)
-        # Map to original and normalized ranges
-        Lo, Uo = L_orig.values, U_orig.values
-        Ln, Un = L_norm.values, U_norm.values
+        u01 = sobol_u01(self.num, d=d, seed=0)
+
+        # Safely widen degenerate columns so uniform sampling does not collapse
+        L_wide, U_wide = _widen_bounds(L_orig, U_orig, min_span=1e-6, frac=0.05)
+
+        # Map to original ranges (widened if necessary)
+        Lo, Uo = L_wide.values, U_wide.values
         X_orig = Lo + u01 * (Uo - Lo)
-        X_norm = Ln + u01 * (Un - Ln)
+
+        # Also return a normalized representation spanning [-1, 1] regardless of data ranges
+        X_norm = 2.0 * u01 - 1.0
+
         return pd.DataFrame(X_orig, columns=cols), pd.DataFrame(X_norm, columns=cols)
-        #return pd.DataFrame(random_initial_original,columns=self.data_states.columns), pd.DataFrame(random_initial_normalized,columns=self.data_states.columns)
     
     def _arcsine_sample(self):
         L_orig, U_orig = self.data_states.min(), self.data_states.max()
-        L_norm, U_norm = self.data_norm.min(), self.data_norm.max()
         cols = self.data_states.columns.tolist()
         d = len(cols)
-        # Sobol + random shift in [0,1]^d
-        u01 = sobol_u01(self.num,d=d,seed=0)
-        # arcsine transformation
-        x = np.cos(np.pi * u01)
-        x = np.clip(x, -1+1e-7, 1-1e-7)
 
-        Lo, Uo = L_orig.values, U_orig.values
-        X_orig = 0.5 * (x+1.0) * (Uo-Lo) + Lo
+        # Sobol + random shift in [0,1]^d
+        u01 = sobol_u01(self.num, d=d, seed=0)
+
+        # arcsine transformation in [-1, 1]
+        x = np.cos(np.pi * u01)
+        x = np.clip(x, -1 + 1e-7, 1 - 1e-7)
+
+        # Safely widen degenerate columns for mapping back to original scale
+        L_wide, U_wide = _widen_bounds(L_orig, U_orig, min_span=1e-6, frac=0.05)
+        Lo, Uo = L_wide.values, U_wide.values
+
+        # Map arcsine sample x ∈ [-1,1] to original ranges
+        X_orig = 0.5 * (x + 1.0) * (Uo - Lo) + Lo
 
         return pd.DataFrame(X_orig, columns=cols), pd.DataFrame(x, columns=cols)
-        """
-        L_orig_array, U_orig_array = L_orig.values, U_orig.values
-        L_norm_array, u_norm_array = L_norm.values, U_norm.values
-        # Initial conditions in the form of num * n_features
-        u = np.random.uniform(low=L_norm_array,high=u_norm_array,size=(self.num,self.n_features))
-        x = np.cos(np.pi * u)
-        arcsine_X_original = 0.5 * (x + 1) * (U_orig_array - L_orig_array) + L_orig_array
-        return pd.DataFrame(arcsine_X_original,columns=self.data_states.columns), pd.DataFrame(x,columns=self.data_states.columns)
-        """
 
 
 class sampling:
@@ -237,17 +258,57 @@ class sampling:
             val = rr.model[param]
             param_dict[param] = val
 
+        # Prepare CVODE integrator (robust defaults for stiff systems)
+        rr.setIntegrator('cvode')
+        cvode = rr.getIntegrator()
+
         filepaths = []
         # ensure integer number of points and include both endpoints (step=5 in the Beer model)
         for k in range(len(ic_df)):
-            # Initialize by position to avoid label KeyError
-            vals = ic_df.iloc[k].to_numpy()
+            # Initialize by position to avoid label KeyError; enforce non-negativity for species
+            vals = np.array(ic_df.iloc[k].to_numpy(), dtype=float)
+            vals = np.where(np.isfinite(vals), np.maximum(vals, 0.0), 0.0)
             for s, v in zip(species_ids, vals):
-                if np.isfinite(v):
-                    rr[f'init({s})'] = float(v)
+                rr[f'init({s})'] = float(v)
 
             rr.reset()
-            res = rr.simulate(start, end, n_step)
+
+            # Configure integrator options *after* reset (some options may reset with the model)
+            try:
+                cvode.setValue('stiff', True)  # use BDF/Newton for stiff problems
+            except Exception:
+                pass
+            try:
+                cvode.setValue('relative_tolerance', 1e-6)
+                cvode.setValue('absolute_tolerance', 1e-10)
+            except Exception:
+                pass
+            try:
+                cvode.setValue('maximum_num_steps', int(1e6))
+                cvode.setValue('variable_step_size', True)
+            except Exception:
+                pass
+            # Limit maximum step size to the output spacing (helps convergence)
+            try:
+                dt = (float(end) - float(start)) / max(int(n_step) - 1, 1)
+                if np.isfinite(dt) and dt > 0:
+                    cvode.setValue('maximum_step_size', float(dt))
+            except Exception:
+                pass
+
+            # Try to simulate; on failure, relax tolerances and shrink max step
+            try:
+                res = rr.simulate(start, end, n_step)
+            except RuntimeError:
+                try:
+                    cvode.setValue('relative_tolerance', 1e-5)
+                    cvode.setValue('absolute_tolerance', 1e-8)
+                    if 'dt' in locals() and np.isfinite(dt) and dt > 0:
+                        cvode.setValue('maximum_step_size', float(dt) / 10.0)
+                except Exception:
+                    pass
+                res = rr.simulate(start, end, n_step)
+
             df = pd.DataFrame(res, columns=rr.timeCourseSelections)
 
             # Rename [S] -> S for consistency
