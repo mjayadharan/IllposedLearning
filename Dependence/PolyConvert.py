@@ -109,11 +109,18 @@ class MultivariatePolynomial:
         return result
     
 
-class ChebyshevToPolynomialConverter:
-    def __init__(self,max_degree):
+class OrthogonalToPolynomialConverter:
+    def __init__(self, max_degree, basis: str = 'Legendre'):
         self.max_degree = max_degree
+        self.basis = basis.capitalize()
+        if self.basis not in ('Chebyshev', 'Legendre'):
+            raise ValueError(f"Unsupported basis '{basis}'. Use 'Chebyshev' or 'Legendre'.")
         self._chebyshev_cache = {}
-        self._precompute_chebyshev_polynomials()
+        self._legendre_cache = {}
+        if self.basis == 'Chebyshev':
+            self._precompute_chebyshev_polynomials()
+        else:
+            self._precompute_legendre_polynomials()
 
     def _precompute_chebyshev_polynomials(self):
         # T_0(x) = 1, the first 0 represents 0 degree Chebyshev basis, the second zero represents x^0
@@ -124,27 +131,45 @@ class ChebyshevToPolynomialConverter:
         # Derive T_n(x) with recurrence definition: T_n+1(x) = 2x T_n(x) - T_n-1(x)
         for n in range(2,self.max_degree+1):
             self._chebyshev_cache[n] = defaultdict(float)
-
             for power, coeff in self._chebyshev_cache[n-1].items():
-                # Note x T_n(x) equals to times x to each term in T_n(x)
                 self._chebyshev_cache[n][power+1] += 2 * coeff
             for power, coeff in self._chebyshev_cache[n-2].items():
                 self._chebyshev_cache[n][power] -= coeff
             # Clean up coefficients close to zero
             self._chebyshev_cache[n] = {k: v for k,v in self._chebyshev_cache[n].items()
                                         if abs(v) > 1e-27}
+
+    def _precompute_legendre_polynomials(self):
+        # P_0(x) = 1
+        self._legendre_cache[0] = {0: 1.0}
+        # P_1(x) = x
+        self._legendre_cache[1] = {1: 1.0}
+        # (n+1) P_{n+1}(x) = (2n+1) x P_n(x) - n P_{n-1}(x)
+        for n in range(1, self.max_degree):
+            next_poly = defaultdict(float)
+            # (2n+1) x P_n(x)
+            for power, coeff in self._legendre_cache[n].items():
+                next_poly[power+1] += (2*n + 1) * coeff
+            # - n P_{n-1}(x)
+            for power, coeff in self._legendre_cache[n-1].items():
+                next_poly[power] -= n * coeff
+            # divide by (n+1)
+            for power in list(next_poly.keys()):
+                next_poly[power] /= (n + 1)
+            # cleanup
+            self._legendre_cache[n+1] = {k: v for k, v in next_poly.items() if abs(v) > 1e-27}
     
-    def _get_chebyshev_polynomial(self,degree,variable:str) -> MultivariatePolynomial:
-        """Get the polynomial corresponding to T_n(variable)"""
+    def _get_univariate_poly(self, degree, variable: str) -> MultivariatePolynomial:
+        """Get the polynomial corresponding to T_n(variable) or P_n(variable) depending on basis."""
         if degree > self.max_degree:
             raise ValueError(f"Degree {degree} exceeds maximum cached degree {self.max_degree}")
-        
         poly = MultivariatePolynomial([variable])
-
-        for power, coeff in self._chebyshev_cache[degree].items():
-            powers = (power,)
-            poly.add_term(powers,coeff)
-
+        if self.basis == 'Chebyshev':
+            cache = self._chebyshev_cache
+        else:
+            cache = self._legendre_cache
+        for power, coeff in cache[degree].items():
+            poly.add_term((power,), coeff)
         return poly
     
     def _parse_sindy_equation(self,equation_str:str) -> Tuple[str, str]:
@@ -156,36 +181,32 @@ class ChebyshevToPolynomialConverter:
         lhs = parts[1].strip()
         return rhs, lhs
     
-    def _parse_chebyshev_term(self,term_str) -> Tuple[float, List[Tuple[str, int]]]:
+    def _parse_orthogonal_term(self, term_str) -> Tuple[float, List[Tuple[str, int]]]:
         """
-        Parse Chebyshev term, for instance a term like alpha T_1(x3) T_1(x4).
-        return (coefficient, [(variable, degree), ...])
+        Parse a term like `alpha T_1(x3) T_2(x1)` (Chebyshev) or `alpha P_1(x3) P_2(x1)` (Legendre).
+        Returns (coefficient, [(variable, degree), ...])
         """
         if isinstance(term_str, list):
-            if len(term_str) == 1:
-                term_str = term_str[0]
-            else:
-                term_str = ' '.join(str(item) for item in term_str)
-    
+            term_str = ' '.join(str(item) for item in term_str)
         if not isinstance(term_str, str):
             term_str = str(term_str)
-
         term_str = term_str.strip()
 
-        t_match = re.search(r'T_', term_str)
+        symbol = 'T_' if self.basis == 'Chebyshev' else 'P_'
+        t_match = re.search(symbol, term_str)
         if t_match:
             coeff_str = term_str[:t_match.start()].strip()
-            chebyshev_part = term_str[t_match.start():].strip()
+            basis_part = term_str[t_match.start():].strip()
         else:
-            # No Chebyshev terms，only constants
+            # No basis functions present -> constant term
             try:
                 coeff = float(term_str)
                 return coeff, []
             except ValueError:
                 raise ValueError(f"Cannot parse term: {term_str}")
-            
-        # parse coefficient
-        if coeff_str in ['','+']:
+
+        # coefficient
+        if coeff_str in ('', '+'):
             coefficient = 1.0
         elif coeff_str == '-':
             coefficient = -1.0
@@ -194,44 +215,33 @@ class ChebyshevToPolynomialConverter:
                 coefficient = float(coeff_str)
             except ValueError:
                 raise ValueError(f"Invalid coefficient: {coeff_str}")
-            
-        # parse chebyshev terms
-        chebyshev_terms = []
-        pattern = r'T_(\d+)\(([^)]+)\)'
-        matches = re.findall(pattern, chebyshev_part)
 
+        # basis function occurrences
+        pattern = r'T_(\d+)\(([^)]+)\)' if self.basis == 'Chebyshev' else r'P_(\d+)\(([^)]+)\)'
+        matches = re.findall(pattern, basis_part)
+        cheb_terms: List[Tuple[str, int]] = []
         for degree_str, variable in matches:
-            degree = int(degree_str)
-            chebyshev_terms.append((variable,degree))
-
-        return coefficient, chebyshev_terms
+            cheb_terms.append((variable, int(degree_str)))
+        return coefficient, cheb_terms
     
-    def _convert_chebyshev_term_to_polynomial(self,
-                                              coefficient: float,
-                                              chebyshev_terms: List[Tuple[str,int]],
-                                              all_variables: List[str]) -> MultivariatePolynomial:
-        """Convert Chebyshev terms to polynomials"""
+    def _convert_basis_term_to_polynomial(self,
+                                          coefficient: float,
+                                          basis_terms: List[Tuple[str,int]],
+                                          all_variables: List[str]) -> MultivariatePolynomial:
         result = MultivariatePolynomial(all_variables)
-        result.add_term(tuple(0 for _ in all_variables),1.0) # Initially set as 1
-
-        for variable, degree in chebyshev_terms:
+        result.add_term(tuple(0 for _ in all_variables), 1.0)
+        for variable, degree in basis_terms:
             if variable not in all_variables:
                 raise ValueError(f"Variable {variable} not in variable list")
-            # Derive the polynomial expression of T_degree(variable)
-            single_var_poly = self._get_chebyshev_polynomial(degree,variable)
-
+            single_var_poly = self._get_univariate_poly(degree, variable)
             multi_var_poly = MultivariatePolynomial(all_variables)
             var_index = all_variables.index(variable)
-
             for (power,), coeff in single_var_poly.terms.items():
                 powers = [0] * len(all_variables)
                 powers[var_index] = power
-                multi_var_poly.add_term(tuple(powers),coeff)
-            
+                multi_var_poly.add_term(tuple(powers), coeff)
             result = result * multi_var_poly
-        
         result = result * coefficient
-
         return result
     
     def convert_sindy_model(self,equations:Union[List[str], List[str]],
@@ -241,12 +251,14 @@ class ChebyshevToPolynomialConverter:
         equations: 1. Full equation list including both rhs and lhs
                     2. Equation list only has rhs
         variable names: If None and the input is the right side of the equation, it is automatically inferred
-        
+
+        Supports Chebyshev or Legendre equations, controlled by basis.
+
         Return:
         Dict[Variable name, Polynomial]
         """
         has_equations_format = any('=' in eq for eq in equations)
-        
+
         if has_equations_format:
             # Format 1
             return self._convert_full_equations(equations)
@@ -258,7 +270,7 @@ class ChebyshevToPolynomialConverter:
         """
         Convert the full SINDy model
         equations: Equation list of the SINDy model
-        
+
         Returns:
         Dict[Variable name, Polynomial]
         """
@@ -273,9 +285,10 @@ class ChebyshevToPolynomialConverter:
                 derivative_var = var_match.group(1)
                 all_variables.add(derivative_var)
             # From rhs
-            variables = re.findall(r'T_\d+\(([^)]+)\)', rhs)
+            pattern = r'T_\d+\(([^)]+)\)' if self.basis == 'Chebyshev' else r'P_\d+\(([^)]+)\)'
+            variables = re.findall(pattern, rhs)
             all_variables.update(variables)
-        
+
         all_variables = sorted(list(all_variables))
 
         # Handle every equation
@@ -286,7 +299,7 @@ class ChebyshevToPolynomialConverter:
                 continue
             derivative_var = var_match.group(1)
 
-            result_poly = self._convert_equation_right_side(rhs, all_variables)
+            result_poly = self._convert_rhs(rhs, all_variables)
             results[derivative_var] = result_poly
 
         return results
@@ -295,11 +308,12 @@ class ChebyshevToPolynomialConverter:
                                variable_names: List[str] = None) -> Dict[str, MultivariatePolynomial]:
         if variable_names is None:
             all_variables = set()
+            pattern = r'T_\d+\(([^)]+)\)' if self.basis == 'Chebyshev' else r'P_\d+\(([^)]+)\)'
             for eq in equations_list:
-                variables = re.findall(r'T_\d+\(([^)]+)\)', eq)
+                variables = re.findall(pattern, eq)
                 all_variables.update(variables)
             variable_names = sorted(list(all_variables))
-        
+
         if len(equations_list) != len(variable_names):
             print(f"Warning: The number of equtions({len(equations_list)})doesn't match the length the number of variables({len(variable_names)})")
             n_equations = min(len(equations_list), len(variable_names))
@@ -312,7 +326,7 @@ class ChebyshevToPolynomialConverter:
             lhs = variable_names[i]
             result_poly = self._convert_rhs(rhs,variable_names)
             results[lhs] = result_poly
-        
+
         return results
     
     def _convert_rhs(self,equation_rhs:str,all_variables:List[str]) -> MultivariatePolynomial:
@@ -321,17 +335,17 @@ class ChebyshevToPolynomialConverter:
         terms = self._split_equation_terms(equation_rhs)
 
         for term in terms:
-                if not term:
-                    continue
-                try:
-                    coefficient, chebyshev_terms = self._parse_chebyshev_term(term)
-                    term_poly = self._convert_chebyshev_term_to_polynomial(
-                        coefficient,chebyshev_terms,all_variables
-                    )
-                    result_poly = result_poly + term_poly
-                except Exception as e:
-                    print(f"Warning: Cannot parse '{term}':{e}")
-                    continue
+            if not term:
+                continue
+            try:
+                coefficient, basis_terms = self._parse_orthogonal_term(term)
+                term_poly = self._convert_basis_term_to_polynomial(
+                    coefficient, basis_terms, all_variables
+                )
+                result_poly = result_poly + term_poly
+            except Exception as e:
+                print(f"Warning: Cannot parse '{term}':{e}")
+                continue
         result_poly._simplify()
         return result_poly
     
