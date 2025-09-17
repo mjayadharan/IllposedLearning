@@ -4,11 +4,13 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error
 from matplotlib.ticker import LogFormatterExponent
+from sympy import symbols, expand, sympify, Poly, collect, simplify
+from scipy.linalg import lstsq
 
 from dae_finder import sequentialThLin
 from Comparison import standardize_columns, TimeSeriesDerivative
-from Basis import OrthogonalLibrary, normalization
-from PolyConvert import ChebyshevToPolynomialConverter, EquationDenormalizer
+from Basis import OrthogonalLibrary, Monomials, normalization
+from PolyConvert import OrthogonalToPolynomialConverter, EquationDenormalizer
 import pysindy as ps
 
 import re
@@ -85,8 +87,9 @@ class Recover_Model_sindy:
         self.method = method
 
         self.data_states, self.time = self._preprocess()
+        self.features = list(self.data_states.columns)
 
-        if method == 'Monomial':
+        if self.method == 'Monomial':
             self.model_expression = self._recovered_model_monomial()
         else:
             self.model_expression = self._recovered_model_orthogonal()
@@ -100,7 +103,7 @@ class Recover_Model_sindy:
         time = data[time_col_name].to_numpy()
         data_states = data.copy().drop(columns={time_col})
 
-        self.features = data_states.columns.tolist()
+        #self.features = list(data_states.columns)
         if self.method == 'Chebyshev' or self.method == 'Legendre':
             self.data_norm, self.L, self.U = normalization(data_states)
         return data_states, time
@@ -171,25 +174,47 @@ class Recover_Model_sindy:
         model.fit(self.data_norm,t=self.time)
         eq_list = model.equations()
 
-        converter = ChebyshevToPolynomialConverter(max_degree=self.poly_degree)
+        converter = OrthogonalToPolynomialConverter(max_degree=self.poly_degree, basis=self.method)
         polynomial_model = converter.convert_sindy_model(eq_list)
 
         denormalizer = EquationDenormalizer(self.L,self.U)
         equation_list = [f"d{var}/dt = {poly._to_string()}" for var, poly in polynomial_model.items()]
         original_equations = denormalizer.denormalize_equations(equation_list)
 
+        # Parse original_equations of the form "dx/dt = ..." into {var: rhs}
+        eq_map = {}
+        for eq in original_equations:
+            parts = eq.split('=', 1)
+            lhs = parts[0].strip()
+            rhs = parts[1].strip() if len(parts) > 1 else ''
+            m = re.match(r"^d(?P<var>.+)/dt$", lhs)
+            if m:
+                var_name = m.group('var').strip()
+                eq_map[var_name] = rhs
+
+        # Build rows strictly following self.features; fall back by index if needed
         states, rhs_raw = [], []
-        for var, eq in zip(model.feature_names, original_equations):
-            parts = eq.split('=')
-            states.append(f'd{var}/dt')
-            rhs_raw.append(parts[1].strip())
+        for i, var in enumerate(self.features):
+            if var in eq_map:
+                rhs_raw.append(eq_map[var])
+                states.append(f'd{var}/dt')
+            else:
+                # Fallback: use i-th equation if available
+                if i < len(original_equations):
+                    parts = original_equations[i].split('=', 1)
+                    rhs_fallback = parts[1].strip() if len(parts) > 1 else original_equations[i].strip()
+                    rhs_raw.append(rhs_fallback)
+                else:
+                    rhs_raw.append('')
+                states.append(f'd{var}/dt')
+
         def clean(eq: str) -> str:
             eq = re.sub(r'\+\s+-', '- ', eq)
             eq = re.sub(r'\s+', ' ', eq).strip()
             return eq
         rhs = [clean(s) for s in rhs_raw]
         df = pd.DataFrame({
-            'Varaiable': states,
+            'Variable': states,
             'Equation': rhs
         })
         return df
@@ -323,3 +348,539 @@ def plot_pareto(coefs, opt, model, threshold_scan, x_test, t_test):
         plt.yticks(fontsize=16)
         plt.grid(True)
         #plt.gca().xaxis.set_major_formatter(formatter)
+
+
+class MonomialToLegendreConverter:
+    """
+    Converts SINDy-recovered ODEs from monomial basis to Legendre polynomial basis
+    using the library definitions from Basis.py.
+    
+    Why generate libraries?
+    -----------------------
+    Even though SINDy already used libraries, we need to regenerate them here to:
+    1. Parse the monomial terms in SINDy's output equation
+    2. Build the mathematical mapping (conversion matrix) between bases
+    3. Solve the inverse problem: given monomial coefficients, find Legendre coefficients
+    
+    The libraries here should match your SINDy configuration exactly to ensure
+    consistency in the conversion.
+    """
+    
+    def __init__(self, data, max_degree=3, normalize=False, include_bias=False):
+        """
+        Initialize the converter using your library definitions.
+        
+        Parameters:
+        -----------
+        data : pd.DataFrame
+            The original data used for SINDy (with time column)
+        max_degree : int
+            Maximum polynomial degree to consider
+        normalize : bool
+            Whether to normalize the data to [-1, 1] range (recommended for Legendre)
+        include_bias : bool
+            Whether to include constant term (should match your SINDy setup)
+            Default False to match your configuration
+        """
+        self.data = data
+        self.max_degree = max_degree
+        self.normalize = normalize
+        self.include_bias = include_bias  # Should match your SINDy setup
+        
+        # Standardize column names and identify state variables
+        self.data_std, self.time_col = standardize_columns(data)
+        self.data_states = self.data_std.drop(columns=self.time_col)
+        self.n_states = len(self.data_states.columns)
+        
+        # Create symbolic variables matching standardized names
+        self.state_symbols = symbols([col for col in self.data_states.columns])
+        if self.n_states == 1:
+            self.state_symbols = (self.state_symbols,)
+        
+        # Handle normalization if requested
+        if normalize:
+            self.data_norm, self.L, self.U = normalization(self.data_states)
+        else:
+            self.data_norm = self.data_states
+            self.L = {col: -1 for col in self.data_states.columns}
+            self.U = {col: 1 for col in self.data_states.columns}
+        
+        # Generate basis libraries using your classes
+        self._generate_libraries()
+        
+    def _generate_libraries(self):
+        """Generate monomial and Legendre libraries using your library classes.
+        This should match your SINDy configuration exactly."""
+        
+        # Generate monomial library
+        self.monomial_lib_data = {}
+        self.monomial_lib_names = []
+        
+        # Add constant term only if include_bias is True
+        if self.include_bias:
+            self.monomial_lib_names.append('1')
+            self.monomial_lib_data['1'] = np.ones(len(self.data_states))
+        
+        # Collect all terms up to max_degree
+        for degree in range(1, self.max_degree + 1):
+            mono_obj = Monomials(self.data, degree)
+            lib_df = mono_obj._generate_library()
+            
+            # Store the transformed data
+            for col in lib_df.columns:
+                if col not in self.monomial_lib_data:
+                    self.monomial_lib_data[col] = lib_df[col].values
+                    self.monomial_lib_names.append(col)
+        
+        # Generate Legendre library using OrthogonalLibrary
+        # This should match your SINDy configuration
+        self.legendre_obj = OrthogonalLibrary(
+            degree=self.max_degree,
+            method='Legendre',
+            include_interaction=True,
+            interaction_only=False,
+            include_bias=self.include_bias  # Match your SINDy setup
+        )
+        
+        # Fit the library to get the structure
+        self.legendre_obj.fit([self.data_norm.values])
+        
+        # Get feature names for Legendre basis
+        self.legendre_lib_names = self.legendre_obj.get_feature_names(
+            input_features=list(self.data_states.columns)
+        )
+        
+        # Transform data to get Legendre features
+        legendre_transformed = self.legendre_obj.transform([self.data_norm.values])[0]
+        self.legendre_lib_data = {}
+        for i, name in enumerate(self.legendre_lib_names):
+            self.legendre_lib_data[name] = legendre_transformed[:, i]
+    
+    def _parse_equation_to_coeffs(self, equation_str):
+        """
+        Parse equation string to extract monomial coefficients.
+        Adapted from Terms_Identification_recovered for better handling of SINDy output.
+        
+        Parameters:
+        -----------
+        equation_str : str
+            RHS of the equation as a string (e.g., "-34344.017*x1**2 + 6066.330*x1*x3 + ...")
+            
+        Returns:
+        --------
+        np.ndarray : Coefficient vector aligned with monomial library
+        """
+        # Initialize coefficient vector
+        coeffs = np.zeros(len(self.monomial_lib_names))
+        
+        # Clean the equation: keep spaces because library terms may be space-separated (e.g., 'x1 x2')
+        equation_str = str(equation_str).strip()
+        
+        # Split into terms while preserving signs
+        terms = self._split_equation_into_terms(equation_str)
+        
+        for term in terms:
+            # Extract coefficient and variable part from each term
+            coeff, var_part = self._extract_coefficient_and_variables(term)
+            
+            if var_part == '':
+                # Constant term
+                if self.include_bias and '1' in self.monomial_lib_names:
+                    idx = self.monomial_lib_names.index('1')
+                    coeffs[idx] += coeff
+                elif not self.include_bias and abs(coeff) > 1e-10:
+                    print(f"Warning: Found constant term {coeff} but include_bias=False")
+            else:
+                # Convert to library format
+                lib_format = self._convert_to_library_format(var_part)
+                
+                # Find in library
+                if lib_format in self.monomial_lib_names:
+                    idx = self.monomial_lib_names.index(lib_format)
+                    coeffs[idx] += coeff
+                else:
+                    # Debug: print what couldn't be found
+                    print(f"Warning: Term '{lib_format}' not found in library")
+                    print(f"  Available similar terms: {[t for t in self.monomial_lib_names if any(v in t for v in lib_format.split())][:5]}")
+        
+        return coeffs
+    
+    def _split_equation_into_terms(self, equation):
+        """Split equation into terms, handling + and - correctly."""
+        terms = []
+        current_term = ""
+        
+        i = 0
+        while i < len(equation):
+            char = equation[i]
+            
+            if char in ['+', '-'] and i > 0:
+                # Check if this is actually a sign for the next term
+                # (not part of scientific notation like 1e-3)
+                if i > 0 and equation[i-1] not in ['e', 'E']:
+                    if current_term:
+                        terms.append(current_term)
+                    current_term = char if char == '-' else ''
+                else:
+                    current_term += char
+            else:
+                current_term += char
+            i += 1
+        
+        if current_term and current_term not in ['+', '-', '']:
+            terms.append(current_term)
+        
+        return terms
+    
+    def _extract_coefficient_and_variables(self, term):
+        """
+        Extract numerical coefficient and variable part from a term.
+        Examples: 
+            '-34.5*x1**2' -> (-34.5, 'x1**2')
+            'x1*x2' -> (1.0, 'x1*x2')
+            '-x1' -> (-1.0, 'x1')
+            '5.0' -> (5.0, '')
+        """
+        term = str(term).strip()
+        if not term:
+            return 0.0, ''
+
+        # Handle leading sign
+        sign = 1.0
+        if term[0] == '-':
+            sign = -1.0
+            term = term[1:]
+        elif term[0] == '+':
+            term = term[1:]
+        term = term.strip()
+        if not term:
+            return 0.0, ''
+
+        # Pattern: optional numeric coeff followed by optional "*vars"
+        # Supports scientific notation like 1e-3
+        m = re.match(r'^(\d*\.?\d+(?:[eE][+-]?\d+)?)\*?(.*)$', term)
+        if m:
+            coeff_str = m.group(1)
+            rest = m.group(2)
+            if coeff_str:
+                try:
+                    coeff = float(coeff_str)
+                except ValueError:
+                    coeff = 1.0
+            else:
+                coeff = 1.0
+            var_part = rest.strip()
+            return sign * coeff, var_part
+
+        # No leading number -> implicit coefficient 1, entire term is variables
+        return sign * 1.0, term
+
+    def _convert_to_library_format(self, var_part):
+        """
+        Convert a variable product string to the monomial library naming.
+        Input examples: 'x1 x2', 'x1*x2', 'x1**2*x3', 'x1^2 x3', 'x1x2'
+        Output examples: 'x1 x2', 'x1 x2', 'x1^2 x3', 'x1^2 x3', 'x1 x2'
+        """
+        var_part = str(var_part).strip()
+        if var_part == '' or var_part == '1':
+            return '1' if self.include_bias else ''
+
+        # Helper to accumulate tokens into power_map
+        def accumulate_tokens(tokens):
+            pmap = {}
+            for tok in tokens:
+                if not tok:
+                    continue
+                m = re.match(r'^(x\d+)(?:\*\*(\d+)|\^(\d+))?$', tok)
+                if m:
+                    var = m.group(1)
+                    p = m.group(2) or m.group(3)
+                else:
+                    # Try a looser match like xA, xalpha, etc.
+                    m2 = re.match(r'^(x\w+)(?:\*\*(\d+)|\^(\d+))?$', tok)
+                    if not m2:
+                        continue
+                    var = m2.group(1)
+                    p = m2.group(2) or m2.group(3)
+                exp = int(p) if p else 1
+                pmap[var] = pmap.get(var, 0) + exp
+            return pmap
+
+        # First try splitting by '*' and whitespace simultaneously
+        raw = var_part.replace(' ', ' ').strip()
+        tokens = re.split(r'[\*\s]+', raw)
+        power_map = accumulate_tokens(tokens)
+
+        # If nothing parsed and there are no separators, support implicit multiplication like 'x1x2x3'
+        if not power_map:
+            implicit_tokens = []
+            for m in re.finditer(r'(x\d+)(?:\*\*(\d+)|\^(\d+))?', var_part):
+                var = m.group(1)
+                p = m.group(2) or m.group(3)
+                implicit_tokens.append(var if not p else f"{var}^{p}")
+            if implicit_tokens:
+                power_map = accumulate_tokens(implicit_tokens)
+
+        if not power_map:
+            return ''
+
+        # Build normalized library name: sort variables, use ^ only if power > 1
+        parts = []
+        for var in sorted(power_map.keys(), key=lambda s: (len(s), s)):
+            exp = power_map[var]
+            if exp == 1:
+                parts.append(var)
+            else:
+                parts.append(f"{var}^{exp}")
+        return ' '.join(parts)
+    
+    def _build_conversion_matrix(self):
+        """
+        Build the conversion matrix from Legendre to monomial basis.
+        Maps Legendre coefficients to monomial coefficients.
+        
+        Returns:
+        --------
+        numpy.ndarray : Conversion matrix M where M @ alpha_legendre = alpha_monomial
+        """
+        n_mono = len(self.monomial_lib_names)
+        n_leg = len(self.legendre_lib_names)
+        
+        # Create conversion matrix
+        M = np.zeros((n_mono, n_leg))
+        
+        # For each Legendre basis function, express it in monomial basis
+        for j, leg_name in enumerate(self.legendre_lib_names):
+            # Get Legendre basis function values
+            leg_values = self.legendre_lib_data[leg_name]
+            
+            # Fit monomials to approximate this Legendre function
+            # Using least squares: find coeffs such that Σ coeffs_i * mono_i ≈ leg_j
+            mono_matrix = np.column_stack([self.monomial_lib_data[name] 
+                                          for name in self.monomial_lib_names])
+            
+            # Solve for coefficients
+            coeffs, _, _, _ = lstsq(mono_matrix, leg_values)
+            
+            # Store in conversion matrix
+            M[:, j] = coeffs
+        
+        return M
+    
+    def convert_equation(self, equation_str):
+        """
+        Convert a single equation from monomial to Legendre basis.
+        
+        Parameters:
+        -----------
+        equation_str : str
+            RHS of the equation in monomial form
+            
+        Returns:
+        --------
+        tuple : (legendre_coeffs, legendre_expression_str)
+        """
+        # Parse monomial equation to get coefficient vector
+        alpha_mono = self._parse_equation_to_coeffs(equation_str)
+        
+        # Build conversion matrix
+        M = self._build_conversion_matrix()
+        
+        # Solve for Legendre coefficients: M @ alpha_leg = alpha_mono
+        alpha_leg, _, _, _ = lstsq(M, alpha_mono)
+        
+        # Threshold small coefficients
+        alpha_leg[np.abs(alpha_leg) < 1e-10] = 0
+        
+        # Build Legendre expression string
+        terms = []
+        for i, (coeff, name) in enumerate(zip(alpha_leg, self.legendre_lib_names)):
+            if abs(coeff) > 1e-10:
+                if name == '1':
+                    terms.append(f"{coeff:.6f}")
+                else:
+                    if coeff > 0 and len(terms) > 0:
+                        terms.append(f"+ {coeff:.6f}*{name}")
+                    else:
+                        terms.append(f"{coeff:.6f}*{name}")
+        
+        legendre_expr = " ".join(terms) if terms else "0"
+        
+        return alpha_leg, legendre_expr
+    
+    def convert_dataframe(self, df, state_col=None, equation_col=None):
+        """
+        Convert a dataframe of SINDy results from monomial to Legendre basis.
+        
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            DataFrame with SINDy results
+        state_col : str, optional
+            Name of the column containing state variables (e.g., 'Variable', 'state')
+            If None, will try to auto-detect
+        equation_col : str, optional
+            Name of the column containing equations (e.g., 'Equation', 'equation')
+            If None, will try to auto-detect
+            
+        Returns:
+        --------
+        pd.DataFrame : DataFrame with columns ['state', 'monomial_eq', 'legendre_eq', 
+                                               'legendre_coeffs', 'validation_error']
+        """
+        # Auto-detect column names if not provided
+        if state_col is None:
+            possible_state_cols = ['Variable', 'variable', 'State', 'state', 'Feature', 'feature']
+            for col in possible_state_cols:
+                if col in df.columns:
+                    state_col = col
+                    break
+            if state_col is None:
+                state_col = df.columns[0]  # Default to first column
+                
+        if equation_col is None:
+            possible_eq_cols = ['Equation', 'equation', 'RHS', 'rhs', 'Expression', 'expression']
+            for col in possible_eq_cols:
+                if col in df.columns:
+                    equation_col = col
+                    break
+            if equation_col is None:
+                equation_col = df.columns[1]  # Default to second column
+        
+        results = []
+        
+        for idx, row in df.iterrows():
+            state = row[state_col]
+            monomial_eq = row[equation_col]
+            
+            print(f"Converting {state}...")
+            
+            # Convert to Legendre basis
+            legendre_coeffs, legendre_expr = self.convert_equation(str(monomial_eq))
+            
+            # Validate conversion
+            error = self.validate_conversion(str(monomial_eq), legendre_coeffs)
+            
+            results.append({
+                'state': state,
+                'monomial_eq': monomial_eq,
+                'legendre_eq': legendre_expr,
+                'legendre_coeffs': legendre_coeffs,
+                'validation_error': error
+            })
+            
+            print(f"  Validation error: {error:.2e}")
+        
+        return pd.DataFrame(results)
+    
+    def validate_conversion(self, monomial_eq, legendre_coeffs, n_test_points=100):
+        """
+        Validate conversion by comparing evaluations at test points.
+        
+        Parameters:
+        -----------
+        monomial_eq : str
+            Original equation in monomial form
+        legendre_coeffs : array
+            Coefficients for Legendre basis
+        n_test_points : int
+            Number of random test points
+            
+        Returns:
+        --------
+        float : Maximum absolute error
+        """
+        # Generate random test points
+        if self.normalize:
+            # Test points in [-1, 1]
+            test_points = np.random.uniform(-1, 1, (n_test_points, self.n_states))
+        else:
+            # Test points in original range
+            test_points = np.zeros((n_test_points, self.n_states))
+            for i, col in enumerate(self.data_states.columns):
+                test_points[:, i] = np.random.uniform(self.L[col], self.U[col], n_test_points)
+        
+        # Evaluate monomial expression
+        mono_coeffs = self._parse_equation_to_coeffs(monomial_eq)
+        
+        max_error = 0
+        for point in test_points:
+            # Create test dataframe with single point
+            test_df = pd.DataFrame([point], columns=self.data_states.columns)
+            
+            # Evaluate monomial expression
+            mono_val = 0
+            for coeff, name in zip(mono_coeffs, self.monomial_lib_names):
+                if abs(coeff) > 1e-10:
+                    if name == '1':
+                        mono_val += coeff
+                    else:
+                        # Evaluate monomial term at test point
+                        term_val = 1
+                        # Parse the monomial term
+                        parts = name.replace('^', '**').split(' ')
+                        for part in parts:
+                            if '**' in part:
+                                var, power = part.split('**')
+                                var_idx = list(self.data_states.columns).index(var)
+                                term_val *= point[var_idx] ** int(power)
+                            else:
+                                var_idx = list(self.data_states.columns).index(part)
+                                term_val *= point[var_idx]
+                        mono_val += coeff * term_val
+            
+            # Evaluate Legendre expression
+            if self.normalize:
+                # Normalize test point
+                norm_point = np.zeros(self.n_states)
+                for i, col in enumerate(self.data_states.columns):
+                    norm_point[i] = 2 * (point[i] - self.L[col]) / (self.U[col] - self.L[col]) - 1
+            else:
+                norm_point = point
+            
+            # Transform point using Legendre library
+            leg_features = self.legendre_obj.transform([norm_point.reshape(1, -1)])[0]
+            leg_val = np.dot(legendre_coeffs, leg_features[0])
+            
+            error = abs(mono_val - leg_val)
+            max_error = max(max_error, error)
+        
+        return max_error
+    
+    def verify_sindy_compatibility(self, sindy_library_config):
+        """
+        Verify that the converter configuration matches your SINDy library setup.
+        
+        Parameters:
+        -----------
+        sindy_library_config : dict
+            Dictionary with SINDy configuration:
+            {'method': 'Legendre', 'degree': 2, 'include_bias': False, ...}
+            
+        Returns:
+        --------
+        bool : True if configurations match
+        list : List of any mismatches found
+        """
+        mismatches = []
+        
+        if 'degree' in sindy_library_config:
+            if sindy_library_config['degree'] != self.max_degree:
+                mismatches.append(f"Degree mismatch: SINDy={sindy_library_config['degree']}, Converter={self.max_degree}")
+        
+        if 'include_bias' in sindy_library_config:
+            if sindy_library_config['include_bias'] != self.include_bias:
+                mismatches.append(f"Bias mismatch: SINDy={sindy_library_config['include_bias']}, Converter={self.include_bias}")
+        
+        if 'method' in sindy_library_config:
+            if sindy_library_config['method'] != 'Legendre':
+                mismatches.append(f"Method mismatch: SINDy={sindy_library_config['method']}, Converter=Legendre")
+        
+        if mismatches:
+            print("Configuration mismatches found:")
+            for mismatch in mismatches:
+                print(f"  - {mismatch}")
+            return False, mismatches
+        else:
+            print("Configuration matches SINDy setup ✓")
+            return True, []
