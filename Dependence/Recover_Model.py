@@ -156,7 +156,6 @@ class Recover_Model_sindy:
         return df
     
     def _recovered_model_orthogonal(self):
-        differential_method = ps.FiniteDifference(self.differential_order)
         if self.method == 'Chebyshev':
             feature_library = OrthogonalLibrary(degree=self.poly_degree,method='Chebyshev')
         elif self.method == 'Legendre':
@@ -164,14 +163,24 @@ class Recover_Model_sindy:
         optimizer = ps.STLSQ(threshold=self.threshold)
         feature_names = self.features
 
-        model = ps.SINDy(
-            differentiation_method=differential_method,
-            feature_library=feature_library,
-            optimizer=optimizer,
-            feature_names=feature_names
-        )
-        self.model = model
-        model.fit(self.data_norm,t=self.time)
+        if self.Xdot is None:
+            differential_method = ps.FiniteDifference(self.differential_order)
+            model = ps.SINDy(
+                differentiation_method=differential_method,
+                feature_library=feature_library,
+                optimizer=optimizer,
+                feature_names=feature_names
+            )
+            self.model = model
+            model.fit(self.data_norm,t=self.time)
+        else:
+            model = ps.SINDy(
+                feature_library=feature_library,
+                optimizer=optimizer,
+                feature_names=feature_names
+            )
+            self.model = model
+            model.fit(self.data_norm,t=self.time,x_dot=self.Xdot)
         eq_list = model.equations()
 
         converter = OrthogonalToPolynomialConverter(max_degree=self.poly_degree, basis=self.method)
@@ -207,7 +216,7 @@ class Recover_Model_sindy:
                 else:
                     rhs_raw.append('')
                 states.append(f'd{var}/dt')
-
+        
         def clean(eq: str) -> str:
             eq = re.sub(r'\+\s+-', '- ', eq)
             eq = re.sub(r'\s+', ' ', eq).strip()
@@ -348,6 +357,7 @@ def plot_pareto(coefs, opt, model, threshold_scan, x_test, t_test):
         plt.yticks(fontsize=16)
         plt.grid(True)
         #plt.gca().xaxis.set_major_formatter(formatter)
+
 
 
 class MonomialToLegendreConverter:
