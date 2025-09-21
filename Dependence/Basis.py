@@ -1,19 +1,17 @@
 import numpy as np
 import pandas as pd
-from dae_finder import PolyFeatureMatrix
-
 from numpy.polynomial import Polynomial, chebyshev, legendre
 from typing import Iterator, Tuple
 from numpy.typing import NDArray
 from scipy import sparse
 from sklearn.utils.validation import check_is_fitted
 import re
-
 import pysindy as ps
 from pysindy.utils import AxesArray
 from pysindy.utils import comprehend_axes
-from pysindy.feature_library.base import BaseFeatureLibrary
-from pysindy.feature_library.base import x_sequence_or_item
+from pysindy.feature_library.base import BaseFeatureLibrary, x_sequence_or_item
+
+from dae_finder import PolyFeatureMatrix
 
 def normalization(data_states):
     # data_states: DataFrame, only has state columns
