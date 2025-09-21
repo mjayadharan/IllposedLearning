@@ -17,28 +17,43 @@ from Base_test import Lotka_Volterra, CRN
 
 # Helper for parallel analysis
 def _process_combo(data, distribution, sbml_path, model_name, model_kwargs,
-                   num, n_step, start, end, degree_list, comb_list, method, out_dir_str):
+                   num, n_step, start, end, degree_list, comb_list, method, out_dir_str,
+                   pointwise=False):
     """Worker: run one (num, n_step) combo and return summary dict."""
     # Ensure directory exists in worker
     os.makedirs(out_dir_str, exist_ok=True)
 
-    # Build sampler and simulate
+    # Build sampler and simulate or evaluate pointwise
     Sample = sampling(data, int(num), distribution=distribution)
-    if sbml_path is not None:
-        filepaths = Sample.fit_and_save(sbml_path, out_dir_str, start, end, int(n_step))
-    elif model_name is not None:
-        mk = model_kwargs or {}
-        filepaths = Sample.fit_and_save_base(model_name=model_name,
-                                             out_path=out_dir_str,
-                                             start=start,
-                                             end=end,
-                                             n_step=int(n_step),
-                                             **mk)
+    if pointwise:
+        # Route A: evaluate RHS at joint-uniform points without integrating trajectories
+        if sbml_path is not None:
+            filepaths = Sample.evaluate_and_save_points_sbml(sbml_path, out_dir_str,
+                                                             filename_prefix="PTS")
+        elif model_name is not None:
+            mk = model_kwargs or {}
+            filepaths = Sample.evaluate_and_save_points_base(model_name=model_name,
+                                                             out_path=out_dir_str,
+                                                             filename_prefix="PTS",
+                                                             **mk)
+        else:
+            raise ValueError("Either sbml_path or model_name must be provided to evaluate RHS at points.")
+        subsample = pd.read_excel(filepaths[0])  # one file of pointwise evaluations
     else:
-        raise ValueError("Either sbml_path or model_name must be provided to simulate trajectories.")
-
-    # Subsample
-    subsample = Sample._subsample(filepaths)
+        # Original: simulate trajectories, then subsample
+        if sbml_path is not None:
+            filepaths = Sample.fit_and_save(sbml_path, out_dir_str, start, end, int(n_step))
+        elif model_name is not None:
+            mk = model_kwargs or {}
+            filepaths = Sample.fit_and_save_base(model_name=model_name,
+                                                 out_path=out_dir_str,
+                                                 start=start,
+                                                 end=end,
+                                                 n_step=int(n_step),
+                                                 **mk)
+        else:
+            raise ValueError("Either sbml_path or model_name must be provided to simulate trajectories.")
+        subsample = Sample._subsample(filepaths)
 
     # Resolve time column robustly: prefer 'time' from simulation outputs
     available_cols = subsample.columns
@@ -217,6 +232,107 @@ class sampling:
         self.time_col = Creator.time_col
         self.state_cols = self.data_states.columns.tolist()
 
+    def evaluate_and_save_points_sbml(self, sbml_path: str, out_path: str, filename_prefix: str = "PTS"):
+        """Route A: evaluate RHS at joint-uniform points ([-1,1]^d) via SBML.
+        Writes a single Excel with columns [time, states, d(state)/dt].
+        """
+        out_dir, tag = self._prepare_outdir(out_path, n_step=self.num, filename_prefix=filename_prefix)
+        rr = te.loadSBMLModel(sbml_path)
+        species_ids = [str(s) for s in rr.model.getFloatingSpeciesIds()]
+        self.ID = species_ids
+
+        # Build point set in [-1,1]^d (already constructed by create_initial_conditions)
+        if len(self.sample_norm.columns) != len(species_ids):
+            raise ValueError(
+                f"Column mismatch: {len(self.sample_norm.columns)} columns vs {len(species_ids)} species (IDs: {species_ids})."
+            )
+        X = self.sample_norm.copy()
+        X.columns = species_ids
+
+        # Evaluate RHS at each point
+        rows = []
+        for k in range(len(X)):
+            vals = np.array(X.iloc[k].to_numpy(), dtype=float)
+            vals = np.where(np.isfinite(vals), vals, 0.0)
+            for s, v in zip(species_ids, vals):
+                rr[s] = float(v)
+            rates = rr.getRatesOfChange()
+            row = {s: vals[i] for i, s in enumerate(species_ids)}
+            for i, s in enumerate(species_ids):
+                row[f'd{s}/dt'] = float(rates[i])
+            row['time'] = 0.0
+            rows.append(row)
+        df = pd.DataFrame(rows, columns=['time'] + species_ids + [f'd{s}/dt' for s in species_ids])
+
+        fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_points.xlsx")
+        df.to_excel(fp, index=False)
+        return [fp]
+
+    def evaluate_and_save_points_base(self, model_name: str, out_path: str, filename_prefix: str = "PTS", **model_kwargs):
+        """Route A: evaluate RHS at joint-uniform points ([-1,1]^d) for Base_test models.
+        Writes a single Excel with columns [time, states, d(state)/dt].
+        """
+        out_dir, tag = self._prepare_outdir(out_path, n_step=self.num, filename_prefix=filename_prefix)
+        std_names = list(self.sample_norm.columns)
+        self.ID = std_names
+        X = self.sample_norm.copy()
+
+        rows = []
+        if model_name.lower() == 'lotka-volterra':
+            model_state_names = model_kwargs.get('state_names', ["x","y1","y2"])  # order matters
+            #model_state_names = model_kwargs.get('state_names', ["x","y"])  # order matters
+            if len(model_state_names) != 3:
+                raise ValueError("Lotka-Volterra expects exactly 2 model state names.")
+            if len(std_names) < 3:
+                raise ValueError("Lotka-Volterra requires at least 2 standardized state columns (e.g., x1,x2).")
+            model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
+            params = model_kwargs.get('params')
+            if params is None:
+                raise ValueError("'params' must be provided for Lotka-Volterra in model_kwargs.")
+            lv = Lotka_Volterra(params=params, t_span=(0.0,1.0), t_eval=np.array([0.0,1.0]), z0=[0.0,0.0], noise_level=None)
+            for k in range(len(X)):
+                row = {}
+                # states in model order
+                z = [float(X.loc[k, model_to_std[m]]) for m in model_state_names]
+                dstate = lv.lv_rhs_1_2(0.0, z)
+                # record states in standardized names order
+                for s in std_names:
+                    row[s] = float(X.loc[k, s])
+                for j, m in enumerate(model_state_names):
+                    row[f'd{model_to_std[m]}/dt'] = float(dstate[j])
+                row['time'] = 0.0
+                rows.append(row)
+
+        elif model_name.lower() == 'chemical reaction network' or model_name.lower() == 'crn':
+            model_state_names = model_kwargs.get('state_names', ["S","E","G","P"])  # order matters
+            if len(model_state_names) != 4:
+                raise ValueError("CRN expects exactly 4 model state names.")
+            if len(std_names) < 4:
+                raise ValueError("CRN requires at least 4 standardized state columns (e.g., x1..x4).")
+            model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
+            k_rates = model_kwargs.get('k_rates')
+            if k_rates is None:
+                raise ValueError("'k_rates' must be provided for CRN in model_kwargs.")
+            crn = CRN(k_rates=k_rates, init_cond=[0.0]*4, solvedT=np.array([0.0,1.0]), noise_level=None)
+            for k in range(len(X)):
+                row = {}
+                z = [float(X.loc[k, model_to_std[m]]) for m in model_state_names]
+                dstate = crn.toyEnzRHS(z, 0.0)
+                for s in std_names:
+                    row[s] = float(X.loc[k, s])
+                for j, m in enumerate(model_state_names):
+                    row[f'd{model_to_std[m]}/dt'] = float(dstate[j])
+                row['time'] = 0.0
+                rows.append(row)
+        else:
+            raise ValueError(f"Unsupported base model for pointwise evaluation: {model_name}")
+
+        cols = ['time'] + std_names + [f'd{s}/dt' for s in std_names]
+        df = pd.DataFrame(rows, columns=cols)
+        fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_points.xlsx")
+        df.to_excel(fp, index=False)
+        return [fp]
+
     def _prepare_outdir(self, out_path, n_step, filename_prefix):
         """Ensure output directory contains a run tag with num & n_step.
         If `out_path` already includes the tag, reuse it; otherwise create
@@ -383,11 +499,11 @@ class sampling:
 
         if model_name.lower() == 'lotka-volterra':
             # Map standardized names (x1,x2,...) to the Base_test internal names (x,y)
-            #model_state_names = model_kwargs.get('state_names', ["x", "y1","y2"])  # order matters
-            model_state_names = model_kwargs.get('state_names', ["x", "y"])  # order matters
-            if len(model_state_names) != 2:
+            model_state_names = model_kwargs.get('state_names', ["x", "y1","y2"])  # order matters
+            #model_state_names = model_kwargs.get('state_names', ["x", "y"])  # order matters
+            if len(model_state_names) != 3:
                 raise ValueError("Lotka-Volterra expects exactly 3 model state names.")
-            if len(std_names) < 2:
+            if len(std_names) < 3:
                 raise ValueError("Lotka-Volterra requires at least three standardized state columns (e.g., x1,x2,x3).")
 
             # Build a consistent mapping between model names and standardized names, in order
@@ -418,7 +534,7 @@ class sampling:
                     t = float(df.loc[i, 'time']) if 'time' in df.columns else float(t_eval[i])
                     # Values in model order
                     state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
-                    dstate = lv.lv_rhs_1_1(t, state_vec_model_order)
+                    dstate = lv.lv_rhs_1_2(t, state_vec_model_order)
                     deriv.append(dstate)
                 deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
 
@@ -935,7 +1051,8 @@ class distribution_test:
 
 class Trend_IC_time:
     def __init__(self,data,num_list,distribution,sbml_path=None,start_list=None,end_list=None,time_interval=None,n_steps_list=None,
-                 degree_list=None, comb_list=None, method=None, model_name=None, out_root=None, model_kwargs=None):
+                 degree_list=None, comb_list=None, method=None, model_name=None, out_root=None, model_kwargs=None,
+                 pointwise=False):
         self.data = data
         self.num_list = num_list
         self.distribution = distribution
@@ -950,6 +1067,7 @@ class Trend_IC_time:
         self.model_name = model_name
         self.model_kwargs = model_kwargs or {}
         self.out_root = out_root  # optional base directory for outputs when sbml_path is None
+        self.pointwise = bool(pointwise)
 
         #self.results = self._analysis_summary()
         self.results = self._analysis_summary_parallel()
@@ -997,17 +1115,28 @@ class Trend_IC_time:
                 out_path.mkdir(parents=True, exist_ok=True)
 
                 Sample = sampling(self.data, int(num), distribution=self.distribution)
-                if self.sbml_path is not None:
-                    filepaths = Sample.fit_and_save(self.sbml_path, str(out_path), start, end, int(n_step))
-                elif self.model_name is not None:
-                    filepaths = Sample.fit_and_save_base(model_name=self.model_name,
-                                                         out_path=str(out_path),
-                                                         start=start, end=end, n_step=int(n_step),
-                                                         **(self.model_kwargs or {}))
+                if self.pointwise:
+                    if self.sbml_path is not None:
+                        filepaths = Sample.evaluate_and_save_points_sbml(self.sbml_path, str(out_path), filename_prefix="PTS")
+                    elif self.model_name is not None:
+                        filepaths = Sample.evaluate_and_save_points_base(model_name=self.model_name,
+                                                                         out_path=str(out_path),
+                                                                         filename_prefix="PTS",
+                                                                         **(self.model_kwargs or {}))
+                    else:
+                        raise ValueError("Either sbml_path or model_name must be provided in Trend_IC_time (pointwise mode).")
+                    subsample = pd.read_excel(filepaths[0])
                 else:
-                    raise ValueError("Either sbml_path or model_name must be provided in Trend_IC_time.")
-
-                subsample = Sample._subsample(filepaths)
+                    if self.sbml_path is not None:
+                        filepaths = Sample.fit_and_save(self.sbml_path, str(out_path), start, end, int(n_step))
+                    elif self.model_name is not None:
+                        filepaths = Sample.fit_and_save_base(model_name=self.model_name,
+                                                             out_path=str(out_path),
+                                                             start=start, end=end, n_step=int(n_step),
+                                                             **(self.model_kwargs or {}))
+                    else:
+                        raise ValueError("Either sbml_path or model_name must be provided in Trend_IC_time.")
+                    subsample = Sample._subsample(filepaths)
 
                 # Resolve time column robustly: prefer 'time' produced by simulate()
                 available_cols = subsample.columns
@@ -1375,7 +1504,7 @@ class Trend_IC_time:
             for idx, n_step in enumerate(self.n_steps_list):
                 start, end = _get_start_end(idx)
                 out_path = base_dir / f"IC_{self.distribution}_n{int(num)}_pts{int(n_step)}"
-                tasks.append((num, n_step, start, end, str(out_path)))
+                tasks.append((num, n_step, start, end, str(out_path), self.pointwise))
 
         # Parallel execution
         results = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes')([
@@ -1393,7 +1522,8 @@ class Trend_IC_time:
                 self.comb_list,
                 self.method,
                 out_dir_str,
-            ) for (num, n_step, start, end, out_dir_str) in tasks
+                pointwise,
+            ) for (num, n_step, start, end, out_dir_str, pointwise) in tasks
         ])
 
         self.results = results
