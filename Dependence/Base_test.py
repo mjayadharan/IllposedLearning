@@ -24,7 +24,7 @@ class Lotka_Volterra:
         self.z0 = z0
         self.noise_level = noise_level
 
-        self.data_sim = self.simulate_lv_condition()
+        self.data_sim = self.simulate_lv_condition_1_2()
 
     def lv_rhs_1_1(self, t, z):
         """
@@ -40,12 +40,57 @@ class Lotka_Volterra:
         Lotka-Volterra equations: 1 prey, 2 predators
         """
         x, y1, y2 = z
-        dxdt = self.r * x * (1 - x / self.K) - self.a1 * x * y1 - self.a2 * x * y2
-        dy1dt = self.epsilon1 * x * y1 - self.m1 * y1
-        dy2dt = self.epsilon2 * x * y2 - self.m2 * y2
+        dxdt = self.r * x * (1.0 - x / self.K) - self.a1 * x * y1 - self.a2 * x * y2
+        #dy1dt = y1 * (self.epsilon1 * self.a1 * x - self.m1)
+        #dy2dt = y2 * (self.epsilon2 * self.a2 * x - self.m2)
+        dy1dt = self.epsilon1 * self.a1 * x * y1 - self.m1 * y1
+        dy2dt = self.epsilon2 * self.a2 * x * y2 - self.m2 * y2
         return [dxdt, dy1dt, dy2dt]
+    
+    def simulate_lv_condition_1_1(self):
+        sol = solve_ivp(self.lv_rhs_1_1, self.t_span, self.z0, t_eval=self.t_eval)
+        if self.noise_level is None:
+            dxdt_vals = []
+            dydt_vals = []
+            for t, z in zip(sol.t, sol.y.T):
+                dxdt, dydt = self.lv_rhs_1_1(t, z)
+                dxdt_vals.append(dxdt)
+                dydt_vals.append(dydt)
+            df = pd.DataFrame({
+                "time": sol.t,
+                "x": sol.y[0],
+                'y': sol.y[1],
+                "dxdt": dxdt_vals,
+                "dydt": dydt_vals
+            })
+        else:
+            x_base = sol.y[0]
+            y_base = sol.y[1]
 
-    def simulate_lv_condition(self):
+            x_sigma = np.abs(x_base) * self.noise_level
+            y_sigma = np.abs(y_base) * self.noise_level
+            x_noisy = x_base + np.random.normal(0,x_sigma)
+            y_noisy = y_base + np.random.normal(0,y_sigma)
+
+            # Computer derivatives
+            dxdt_vals = []
+            dydt_vals = []
+            for t, xn, yn in zip(sol.t, x_noisy, y_noisy):
+                dxdt, dydt = self.lv_rhs(t, [xn, yn])
+                dxdt_vals.append(dxdt)
+                dydt_vals.append(dydt)
+
+            df = pd.DataFrame({
+                "time": sol.t,
+                "x": x_noisy,
+                "y": y_noisy,
+                "dxdt": dxdt_vals,
+                "dydt": dydt_vals
+            })
+
+        return df
+
+    def simulate_lv_condition_1_2(self):
         #sol = solve_ivp(self.lv_rhs_1_1, self.t_span, self.z0, t_eval=self.t_eval)
         sol = solve_ivp(self.lv_rhs_1_2, self.t_span, self.z0, t_eval=self.t_eval)
         if self.noise_level is None:
@@ -105,12 +150,14 @@ class CRN:
 
     def toyEnzRHS(self, y, t):
         # Unpack states, params
+        # Rename ES as G
         S, E, ES, P = y
         k, kr, kcat = self.k_rates.get("k"), self.k_rates.get("kr"), self.k_rates.get("kcat")
 
         dydt = [kr * ES - k * E * S,
-                (kr + kcat) * ES - k * S * E,
-                k * E * S - (kr + kcat) * ES,
+                (kr + kcat) * ES - k * E * S,
+                #(kr + kcat) * G * S,
+                k * S * E - (kr + kcat) * ES,
                 kcat * ES]
         return dydt
 
