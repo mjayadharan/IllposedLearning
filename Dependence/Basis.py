@@ -66,25 +66,7 @@ class Monomials:
         candidate_lib_full = poly_feature_ob.fit_transform(self.data_states)
         candidate_lib = candidate_lib_full.drop(["1"], axis=1)
         return candidate_lib
-
-
-def normalization(data_states):
-    # data_states: DataFrame, only has state columns
-    data_norm = data_states.copy()
-    L,U = {},{}
-    for col in data_norm.columns:
-        Li = data_states[col].min()
-        Ui = data_states[col].max()
-        L[col] = Li
-        U[col] = Ui
-        if Li == Ui:
-            data_norm[col] = 0
-            print("Warning: All values are equal")
-        else:
-            data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
-    return data_norm, L, U
     
-
 class OrthogonalLibrary(BaseFeatureLibrary):
     """Generate Chebyshev polynomial features.
     This library generates features using Chebyshev polynomials of the first kind.
@@ -133,6 +115,9 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         self.include_interaction = include_interaction
         self.interaction_only = interaction_only
         self.include_bias = include_bias
+        # Stable, shared ordering for transform() and get_feature_names()
+        self._powers_sorted = None  # list[tuple[int,...]] set in fit()
+        self._n_features = None     # cache input dimensionality
 
     def _get_coord_axis(self, x):
         """Get the coordinate axis"""
@@ -255,14 +240,18 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         Chebyshev polynomial of the jth input variable in the ith feature.
         """
         check_is_fitted(self)
-        combinations = list(self._combinations(
-            n_features=self.n_features_in_,
-            degree=self.degree,
-            include_interaction=self.include_interaction,
-            interaction_only=self.interaction_only,
-            include_bias=self.include_bias,
-        ))
-        return np.array(combinations, dtype=np.int_)
+        if self._powers_sorted is None:
+            # Fallback to combinations if fit() hasn't cached (shouldn't happen)
+            combinations = list(self._combinations(
+                n_features=self.n_features_in_,
+                degree=self.degree,
+                include_interaction=self.include_interaction,
+                interaction_only=self.interaction_only,
+                include_bias=self.include_bias,
+            ))
+            powers_sorted = sorted(combinations, key=lambda row: (np.sum(row), tuple(row)))
+            return np.array(powers_sorted, dtype=np.int_)
+        return np.array(self._powers_sorted, dtype=np.int_)
 
     def get_feature_names(self, input_features=None):
         """Return feature names for output features.
@@ -278,34 +267,31 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         output_feature_names : list of string, length n_output_features
         """
         check_is_fitted(self)
-        powers = np.array(sorted(self.powers_, key=lambda row: (np.sum(row), tuple(row))))
+        powers = self._powers_sorted
+        if powers is None:
+            # Fallback to property (still stable)
+            powers = [tuple(int(v) for v in row) for row in self.powers_]
+
+        # Input feature names
         if input_features is None:
-            input_features = ["x%d" % i+1 for i in range(powers.shape[1])]
-        
-        feature_names = []
+            input_features = [f"x{i+1}" for i in range(self.n_features_in_)]
+
+        prefix = 'T_' if str(self.method).lower().startswith('cheb') else 'P_'
+        names = []
         for row in powers:
             terms = []
-            for feat_idx, degree in enumerate(row):
-                if degree > 0:
-                    if degree == 1:
-                        if self.method == 'Chebyshev':
-                            terms.append(f"T_1({input_features[feat_idx]})")
-                        elif self.method == 'Legendre':
-                            terms.append(f"P_1({input_features[feat_idx]})")
-                    else:
-                        if self.method == 'Chebyshev':
-                            terms.append(f"T_{degree}({input_features[feat_idx]})")
-                        elif self.method == 'Legendre':
-                            terms.append(f"P_{degree}({input_features[feat_idx]})")
-            
-            if len(terms) == 0:
-                name = "1"  # Constant term (T_0)
+            for feat_idx, deg in enumerate(row):
+                if deg <= 0:
+                    continue
+                if int(deg) == 1:
+                    terms.append(f"{prefix}1({input_features[feat_idx]})")
+                else:
+                    terms.append(f"{prefix}{int(deg)}({input_features[feat_idx]})")
+            if not terms:
+                names.append('1')
             else:
-                name = " ".join(terms)
-            
-            feature_names.append(name)
-        
-        return feature_names
+                names.append(' '.join(terms))
+        return names
 
     @x_sequence_or_item
     def fit(self, x_full: list[AxesArray], y=None):
@@ -327,11 +313,11 @@ class OrthogonalLibrary(BaseFeatureLibrary):
             raise ValueError(
                 "Can't have include_interaction be False and interaction_only be True"
             )
-        
+
         # Get the number of features
         coord_axis = self._get_coord_axis(x_full[0])
         n_features = x_full[0].shape[coord_axis]
-        
+
         combinations = list(self._combinations(
             n_features,
             self.degree,
@@ -339,9 +325,13 @@ class OrthogonalLibrary(BaseFeatureLibrary):
             self.interaction_only,
             self.include_bias,
         ))
-        
+
         self.n_features_in_ = n_features
-        self.n_output_features_ = len(combinations)
+        # Cache dimensionality and a stable, shared order of powers
+        self._n_features = n_features
+        powers_sorted = sorted(combinations, key=lambda row: (np.sum(row), tuple(row)))
+        self._powers_sorted = [tuple(int(v) for v in row) for row in powers_sorted]
+        self.n_output_features_ = len(self._powers_sorted)
         return self
 
     @x_sequence_or_item
@@ -361,70 +351,59 @@ class OrthogonalLibrary(BaseFeatureLibrary):
             of Chebyshev polynomial features generated.
         """
         check_is_fitted(self)
+        if self._powers_sorted is None:
+            raise RuntimeError("OrthogonalLibrary not fitted: powers order is missing.")
 
         xp_full = []
         for x in x_full:
             if sparse.issparse(x):
-                raise NotImplementedError("Sparse matrices not yet supported for ChebyshevLibrary")
-            
-            # Get the number of axes and features
+                raise NotImplementedError("Sparse matrices not yet supported for OrthogonalLibrary")
+
+            # Determine coordinate axis and validate shape
             coord_axis = self._get_coord_axis(x)
             n_features = x.shape[coord_axis]
-            
             if n_features != self.n_features_in_:
                 raise ValueError("x shape does not match training shape")
 
-            combinations = list(self._combinations(
-                n_features,
-                self.degree,
-                self.include_interaction,
-                self.interaction_only,
-                self.include_bias,
-            ))
-
-            # Create output array
+            # Create output container
             output_shape = list(x.shape)
             output_shape[coord_axis] = self.n_output_features_
-            
             xp = AxesArray(
                 np.empty(output_shape, dtype=x.dtype),
                 x.axes if hasattr(x, 'axes') else comprehend_axes(x),
             )
 
-            for i, powers in enumerate(combinations):
-                # Compute the product of Chebyshev polynomials
-                result = np.ones(x.shape[:-1] if coord_axis == -1 else 
-                               [x.shape[j] for j in range(len(x.shape)) if j != coord_axis], 
-                               dtype=x.dtype)
-                
-                for feat_idx, degree in enumerate(powers):
-                    if degree > 0:
-                        # Get features from the specified axis
-                        if coord_axis == -1:
-                            feature_data = x[..., feat_idx]
-                        else:
-                            # Create index tuple
-                            idx = [slice(None)] * len(x.shape)
-                            idx[coord_axis] = feat_idx
-                            feature_data = x[tuple(idx)]
-                        
-                        if self.method == 'Chebyshev':
-                            chebyshev_val = self._chebyshev_polynomial(feature_data, degree)
-                            result = result * chebyshev_val
-                        elif self.method == 'Legendre':
-                            legendre_val = self._legendre_polynomial(feature_data, degree)
-                            result = result * legendre_val
-                
-                # Put the results into the output array
+            # Helper to slice out a single feature along coord_axis
+            def take_feature(arr, idx):
+                if coord_axis == -1:
+                    return arr[..., idx]
+                idx_tuple = [slice(None)] * arr.ndim
+                idx_tuple[coord_axis] = idx
+                return arr[tuple(idx_tuple)]
+
+            # Build columns in the cached, stable order
+            for i, powers in enumerate(self._powers_sorted):
+                # Start with ones on the sample axes
+                result = np.ones(x.shape[:coord_axis] + x.shape[coord_axis+1:], dtype=x.dtype)
+                for feat_idx, deg in enumerate(powers):
+                    if deg <= 0:
+                        continue
+                    feat = take_feature(x, feat_idx)
+                    if self.method == 'Chebyshev':
+                        val = self._chebyshev_polynomial(feat, int(deg))
+                    else:  # Legendre
+                        val = self._legendre_polynomial(feat, int(deg))
+                    result = result * val
+
+                # Write column i
                 if coord_axis == -1:
                     xp[..., i] = result
                 else:
-                    idx = [slice(None)] * len(xp.shape)
-                    idx[coord_axis] = i
-                    xp[tuple(idx)] = result
-            
+                    idx_tuple = [slice(None)] * xp.ndim
+                    idx_tuple[coord_axis] = i
+                    xp[tuple(idx_tuple)] = result
+
             xp_full.append(xp)
-        
         return xp_full
     
     def transform_to_dataframe(self, x: np.ndarray, input_feature_names: list[str] = None):
