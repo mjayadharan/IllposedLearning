@@ -155,7 +155,7 @@ class create_initial_conditions:
             self.sample_orig, self.sample_norm = self._arcsine_sample()
 
     def _uniformly_sample(self):
-        L_orig, U_orig = self.data_states.min(), self.data_states.max()
+        self.L_orig, self.U_orig = self.data_states.min(), self.data_states.max()
         cols = self.data_states.columns.tolist()
         d = len(cols)
 
@@ -163,7 +163,7 @@ class create_initial_conditions:
         u01 = sobol_u01(self.num, d=d, seed=0)
 
         # Safely widen degenerate columns so uniform sampling does not collapse
-        L_wide, U_wide = _widen_bounds(L_orig, U_orig, min_span=1e-6, frac=0.05)
+        L_wide, U_wide = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
 
         # Map to original ranges (widened if necessary)
         Lo, Uo = L_wide.values, U_wide.values
@@ -175,7 +175,7 @@ class create_initial_conditions:
         return pd.DataFrame(X_orig, columns=cols), pd.DataFrame(X_norm, columns=cols)
     
     def _arcsine_sample(self):
-        L_orig, U_orig = self.data_states.min(), self.data_states.max()
+        self.L_orig, self.U_orig = self.data_states.min(), self.data_states.max()
         cols = self.data_states.columns.tolist()
         d = len(cols)
 
@@ -187,7 +187,7 @@ class create_initial_conditions:
         x = np.clip(x, -1 + 1e-7, 1 - 1e-7)
 
         # Safely widen degenerate columns for mapping back to original scale
-        L_wide, U_wide = _widen_bounds(L_orig, U_orig, min_span=1e-6, frac=0.05)
+        L_wide, U_wide = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
         Lo, Uo = L_wide.values, U_wide.values
 
         # Map arcsine sample x ∈ [-1,1] to original ranges
@@ -201,15 +201,18 @@ class sampling:
     This class is used for sampling under different initial conditions and finally deriving the time series 
     distributed as a specific distribution.
     """
-    def __init__(self,data,num,distribution='uniform'):
+    def __init__(self,data,num,distribution='uniform',normalize=True):
         # num: how many initial conditions are expected to be generated
         # n_step: how many steps are expected to simulated
         self.data = data
         self.num = num
         self.distribution = distribution
+        self.normalize = normalize
 
         Creator = create_initial_conditions(self.data,self.num,self.distribution)
-        self.sample_orig = Creator.sample_orig
+        #self.sample_orig = Creator.sample_orig
+        self.L_orig, self.U_orig = Creator.L_orig, Creator.U_orig
+        self.sample_norm = Creator.sample_norm
         self.data_states = Creator.data_states
         self.time_col = Creator.time_col
         self.state_cols = self.data_states.columns.tolist()
@@ -239,12 +242,12 @@ class sampling:
         self.ID = species_ids
 
         # Build IC table aligned *positionally* to the species order to avoid label mismatches
-        if len(self.sample_orig.columns) != len(species_ids):
+        if len(self.sample_norm.columns) != len(species_ids):
             raise ValueError(
-                f"Column mismatch: {len(self.sample_orig.columns)} columns vs {len(species_ids)} species (IDs: {species_ids})."
+                f"Column mismatch: {len(self.sample_norm.columns)} columns vs {len(species_ids)} species (IDs: {species_ids})."
                 " Make sure your input data has the same number of state columns as floating species."
             )
-        ic_df = self.sample_orig.copy()
+        ic_df = self.sample_norm.copy()
         # Ensure exact order and names match species_ids
         ic_df.columns = species_ids
 
@@ -314,7 +317,7 @@ class sampling:
             # Rename [S] -> S for consistency
             rename_map = {f'[{s}]': s for s in species_ids}
             df = df.rename(columns=rename_map)
-
+        
             # Sanity check: ensure all species columns are present
             missing_cols = [s for s in species_ids if s not in df.columns]
             if missing_cols:
@@ -369,7 +372,7 @@ class sampling:
         out_dir, tag = self._prepare_outdir(out_path, n_step, filename_prefix)
 
         # Use the standardized names coming from create_initial_conditions, e.g. ['x1','x2', ...]
-        std_names = list(self.sample_orig.columns)
+        std_names = list(self.sample_norm.columns)
         self.ID = std_names  # downstream methods rely on this
 
         # Time grid
@@ -380,10 +383,11 @@ class sampling:
 
         if model_name.lower() == 'lotka-volterra':
             # Map standardized names (x1,x2,...) to the Base_test internal names (x,y)
-            model_state_names = model_kwargs.get('state_names', ["x", "y1","y2"])  # order matters
-            if len(model_state_names) != 3:
+            #model_state_names = model_kwargs.get('state_names', ["x", "y1","y2"])  # order matters
+            model_state_names = model_kwargs.get('state_names', ["x", "y"])  # order matters
+            if len(model_state_names) != 2:
                 raise ValueError("Lotka-Volterra expects exactly 3 model state names.")
-            if len(std_names) < 3:
+            if len(std_names) < 2:
                 raise ValueError("Lotka-Volterra requires at least three standardized state columns (e.g., x1,x2,x3).")
 
             # Build a consistent mapping between model names and standardized names, in order
@@ -395,8 +399,8 @@ class sampling:
                 raise ValueError("'params' must be provided for Lotka-Volterra in model_kwargs.")
             noise_level = model_kwargs.get('noise_level', None)
 
-            for k in range(len(self.sample_orig)):
-                row = self.sample_orig.iloc[k]
+            for k in range(len(self.sample_norm)):
+                row = self.sample_norm.iloc[k]
                 # Initial condition in the model's variable order (x,y)
                 z0= [float(row[s]) for s in std_in_model_order]
 
@@ -414,7 +418,7 @@ class sampling:
                     t = float(df.loc[i, 'time']) if 'time' in df.columns else float(t_eval[i])
                     # Values in model order
                     state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
-                    dstate = lv.lv_rhs_1_2(t, state_vec_model_order)
+                    dstate = lv.lv_rhs_1_1(t, state_vec_model_order)
                     deriv.append(dstate)
                 deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
 
@@ -424,7 +428,7 @@ class sampling:
                 filepaths.append(fp)
 
         elif model_name.lower() == 'crn':
-            model_state_names = model_kwargs.get('state_names', ["S","E","ES","P"])
+            model_state_names = model_kwargs.get('state_names', ["S","E","G","P"])
 
             # Build a consistent mapping between model names and standardized names, in order
             model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
@@ -435,8 +439,9 @@ class sampling:
                 raise ValueError("'k_rates' must be provided for Chemical Reaction Network in model_kwargs.")
             noise_level = model_kwargs.get('noise_level', None)
 
-            for k in range(len(self.sample_orig)):
-                row = self.sample_orig.iloc[k]
+            for k in range(len(self.sample_norm)):
+                row = self.sample_norm.iloc[k]
+                #row.iloc[2] = 0
                 # Initial condition in the model's variable order (x,y)
                 init_cond = [float(row[s]) for s in std_in_model_order]
 
