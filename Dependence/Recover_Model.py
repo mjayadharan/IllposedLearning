@@ -6,6 +6,7 @@ from sklearn.metrics import mean_squared_error
 from matplotlib.ticker import LogFormatterExponent
 from sympy import symbols, expand, sympify, Poly, collect, simplify
 from scipy.linalg import lstsq
+import sympy as sp
 
 from dae_finder import sequentialThLin
 from Comparison import standardize_columns, TimeSeriesDerivative
@@ -73,11 +74,108 @@ class Recover_Model_dae:
                         'Equation':rhs.strip()})
         return pd.DataFrame(rows)
 
+class WhitenedOptimizer:
+    """
+    A thin wrapper for performing “empirical whitening” on incoming PySINDy optimizers:
+      1) Scale only (no centering): s_j = sqrt(mean(Theta[:,j]^2))   # RMS per column
+      2) G = (Theta_s^T Theta_s) / n,  W = G^{-1/2} (eigh)
+      3) Theta_ortho = Theta_s @ W
+      4) Call the underlying optimizer on Theta_ortho to obtain a_hat.
+      5) Projection back to the original space: c = (W @ a_hat) / s
+    """
+    def __init__(self, base_optimizer, eps: float = 1e-12):
+        self.base = base_optimizer
+        self.eps = eps
+        self.coef_ = None  # Post-return assignment
 
+    def _compute_whitener(self, Theta):
+        n, p = Theta.shape
+        # Scaling only (RMS), without mean subtraction, to avoid affecting the constant column.
+        s = np.sqrt(np.mean(Theta ** 2, axis=0))
+        s[s < self.eps] = 1.0
+        Theta_s = Theta / s
+        # Experience Gram
+        G = (Theta_s.T @ Theta_s) / max(n, 1)
+        G = G + self.eps * np.eye(p)
+        w, V = np.linalg.eigh(G)
+        w[w < self.eps] = self.eps
+        W = V @ np.diag(1.0 / np.sqrt(w)) @ V.T
+        return Theta_s, s, W
+
+    def fit(self, Theta, y):
+        Theta_s, s, W = self._compute_whitener(Theta)
+        Theta_ortho = Theta_s @ W
+        fitted = self.base.fit(Theta_ortho, y)
+
+        # Pull coefficients from the wrapped optimizer (before mapping back)
+        coef_hat = getattr(self.base, "coef_", None)
+        if coef_hat is None:
+            coef_hat = getattr(fitted, "coef_", None)
+        if coef_hat is None:
+            raise RuntimeError("Wrapped optimizer did not expose 'coef_' after fit().")
+
+        coef_hat = np.asarray(coef_hat)
+        p = Theta.shape[1]
+
+        # Record the original layout to restore afterwards
+        orig_ndim = coef_hat.ndim
+        orig_shape = coef_hat.shape
+        # Determine (p, m) canonical form
+        if orig_ndim == 1:
+            # Expect (p,)
+            if coef_hat.shape[0] != p:
+                raise ValueError(
+                    f"coef_ length {coef_hat.shape[0]} does not match n_features {p}."
+                )
+            C0 = coef_hat.reshape(p, 1)
+            restore = ("vector", None)  # restore as 1D
+        elif orig_ndim == 2:
+            if coef_hat.shape[0] == p:
+                # (p, m)
+                C0 = coef_hat
+                restore = ("pm", orig_shape)
+            elif coef_hat.shape[1] == p:
+                # (m, p) -> transpose to (p, m)
+                C0 = coef_hat.T
+                restore = ("mp", orig_shape)
+            else:
+                raise ValueError(
+                    f"coef_ has incompatible shape {orig_shape}; expected one dimension equal to p={p}."
+                )
+        else:
+            raise ValueError(f"coef_ has unsupported ndim={orig_ndim}.")
+
+        # Map back to original feature space in canonical (p, m)
+        C_s = W @ C0              # (p, p) @ (p, m) -> (p, m)
+        C = C_s / s[:, None]      # row-wise scale back
+
+        # Restore to the original layout expected by the base optimizer / PySINDy
+        kind, meta = restore
+        if kind == "vector":
+            self.coef_ = C[:, 0]                  # (p,)
+        elif kind == "pm":
+            self.coef_ = C                        # (p, m)
+        elif kind == "mp":
+            self.coef_ = C.T                      # (m, p)
+        else:
+            # Fallback: keep canonical (p, m)
+            self.coef_ = C
+
+        return self
+
+    # Other properties/methods of the transparent underlying optimizer (such as threshold, max_iter, etc.)
+    def __getattr__(self, name):
+        if name in ("base", "eps", "coef_"):    
+            return super().__getattribute__(name)
+        return getattr(self.base, name)
+    
 class Recover_Model_sindy:
-    def __init__(self,data,differential_order,poly_degree,threshold,threshold_scan=None,Xdot=None,method='Monomial'):
+    def __init__(self,data,differential_order,poly_degree,threshold,
+                 threshold_scan=None,Xdot=None,method='Monomial',L=None,U=None,debug=True):
         # data: DataFrame -- contains all columns including states and time
+        # for orthogonal basis, the data should have been normalized
         # method: basis library used, the default one is monomial library
+        # L,U : lower and upper bound of the original data
         self.data = data
         self.differential_order = differential_order
         self.poly_degree = poly_degree
@@ -85,7 +183,11 @@ class Recover_Model_sindy:
         self.threshold_scan = threshold_scan
         self.Xdot = Xdot
         self.method = method
+        self.L, self.U = L, U
+        self.debug = debug
 
+        if self.method != 'Monomial' and (self.L is None or self.U is None):
+            raise ValueError("Need to provide Lower and Upper bound for Orthogonal basis")
         self.data_states, self.time = self._preprocess()
         self.features = list(self.data_states.columns)
 
@@ -94,18 +196,175 @@ class Recover_Model_sindy:
         else:
             self.model_expression = self._recovered_model_orthogonal()
 
+    def _remap_legendre_linear_names_by_corr(self, eq_list):
+        """Return a new eq_list where *single* linear Legendre tags P_1(xi) are renamed
+        to the variable whose raw state column correlates the most with that library column.
+        Products like 'P_1(xi) P_1(xj)' are left untouched.
+        This is purely data-driven and does not inject model priors.
+        """
+        if self.method != 'Legendre':
+            return eq_list
+        mdl = getattr(self, 'model', None)
+        if mdl is None:
+            return eq_list
+        lib = mdl.feature_library
+        X = np.asarray(self.data_states, dtype=float)
+        try:
+            Theta = lib.transform(X)
+        except Exception:
+            Theta = lib.transform([X])[0]
+        try:
+            names = lib.get_feature_names(input_features=self.features)
+        except Exception:
+            names = lib.get_feature_names()
+
+        # Identify linear Legendre columns by name pattern
+        lin_idx = []
+        lin_name = []
+        for j, nm in enumerate(names):
+            if re.fullmatch(r"P_1\(x\w+\)", nm) or re.fullmatch(r"P1\(x\w+\)", nm):
+                lin_idx.append(j)
+                lin_name.append(nm)
+        if not lin_idx:
+            return eq_list
+
+        # Build name -> canonical tag mapping by max |corr| with raw state columns
+        Xarr = np.asarray(X, float)
+        mapping = {}
+        for j, nm in zip(lin_idx, lin_name):
+            corrs = [abs(np.corrcoef(Theta[:, j], Xarr[:, k])[0, 1]) for k in range(Xarr.shape[1])]
+            k_best = int(np.argmax(corrs))
+            mapping[nm] = f"P_1({self.features[k_best]})"
+        if self.debug:
+            print("[REMAP] linear Legendre tags:")
+            for k in mapping:
+                print(f"  {k} -> {mapping[k]}")
+
+        # Replace only tokens that contain exactly one P_1(...) tag (singletons),
+        # leaving product terms intact
+        def remap_rhs(rhs: str) -> str:
+            # split into signed terms while preserving signs
+            parts = re.findall(r"[+-]?\s*[^+-]+", rhs)
+            new_parts = []
+            for term in parts:
+                tags = re.findall(r"P_1\(x\w+\)|P1\(x\w+\)", term)
+                if len(tags) == 1:
+                    t_old = tags[0]
+                    t_new = mapping.get(t_old, t_old)
+                    new_parts.append(term.replace(t_old, t_new))
+                else:
+                    new_parts.append(term)
+            # rejoin and normalize spaces/signs
+            out = " ".join(p.strip() for p in new_parts).strip()
+            out = re.sub(r"\+\s+-", "- ", out)
+            out = re.sub(r"\s+", " ", out)
+            return out
+
+        return [remap_rhs(rhs) for rhs in eq_list]
+
+    def _diagnose_linear_alignment(self):
+        """Call immediately after fitting is complete:
+        - Verify that the order of self.features matches that of self.model.feature_names_.
+        - Construct the library matrix Theta with feature names;
+        - For each state equation, print the projection <phi_j, y> 
+            of that state onto all “linear bases” (xj or P1(xj)).
+          And the values of the final coefficient matrix Xi on these columns, 
+          facilitating the identification of whether x2/x3 is misplaced.
+        """
+        try:
+            mdl = self.model
+        except Exception:
+            print("[DIAG] model not set; skip.")
+            return
+
+        # 1) Name and Sequence Alignment Check
+        model_names = list(getattr(mdl, 'feature_names_', self.features))
+        if model_names != self.features:
+            print("[DIAG][WARN] self.features 与 model.feature_names_ Sequence inconsistency:\n\tself.features=", self.features, "\n\tmodel.feature_names_=", model_names)
+        else:
+            print("[DIAG] feature name order OK ✓")
+
+        # 2) Constructing the library matrix and feature names 
+        # (compatible with OrthogonalLibrary's list-of-trajectories API)
+        lib = mdl.feature_library
+        X = np.asarray(self.data_states, dtype=float)
+        try:
+            Theta = lib.transform(X)
+        except Exception:
+            Theta = lib.transform([X])[0]
+        try:
+            lib_names = lib.get_feature_names(input_features=self.features)
+        except Exception:
+            lib_names = lib.get_feature_names()
+        Xi = np.asarray(mdl.coefficients())  # shape (n_features, n_states)
+
+        # 3) Identify the column index for the “linear term”（monomial: xj; Legendre: P1(xj)/P_1(xj)）
+        def linear_idx_for(var):
+            # Exact match for monomial name
+            if var in lib_names:
+                return lib_names.index(var)
+            # First-order basis matching Legendre
+            patts = [rf"P1\({re.escape(var)}\)", rf"P_1\({re.escape(var)}\)"]
+            for p in patts:
+                for k, nm in enumerate(lib_names):
+                    if re.fullmatch(p, nm):
+                        return k
+            return None
+
+        idx_linear = {v: linear_idx_for(v) for v in self.features}
+        print("[DIAG] linear feature indices:", idx_linear)
+
+        # 4) For each equation, print: <phi_lin, y> and Xi[lin, j]
+        if self.Xdot is None:
+            t = np.asarray(self.time, dtype=float).reshape(-1)
+            Ydot = np.gradient(np.asarray(self.data_states, dtype=float), t, axis=0, edge_order=self.differential_order)
+        else:
+            Ydot = np.asarray(self.Xdot, dtype=float)
+
+        for j, var in enumerate(self.features):
+            y = Ydot[:, j]
+            print(f"\n[DIAG] Equation for d{var}/dt")
+            # List the projections and coefficients of linear terms in variable order.
+            rows = []
+            for v in self.features:
+                idx = idx_linear.get(v)
+                if idx is None:
+                    rows.append((v, None, None))
+                    continue
+                proj = float(Theta[:, idx].T @ y)
+                coef = float(Xi[idx, j]) if idx < Xi.shape[0] else np.nan
+                rows.append((v, proj, coef))
+            # Print
+            print("      var       <phi, y>         coef")
+            for v, pr, cf in rows:
+                pr_s = f"{pr: .6e}" if pr is not None else "   (NA)   "
+                cf_s = f"{cf: .6e}" if cf is not None else "   (NA)   "
+                print(f"    {v:>6s}   {pr_s:>14s}   {cf_s:>14s}")
+
     def _preprocess(self):
         data, time_col = standardize_columns(self.data)
         if isinstance(time_col, list):
-            self.time_col_name = time_col[0]
+            time_col_name = time_col[0]
         else:
             time_col_name = time_col
-        time = data[time_col_name].to_numpy()
+        self.time_col_name = time_col_name
+        time = data[self.time_col_name].to_numpy()
         data_states = data.copy().drop(columns={time_col})
 
-        #self.features = list(data_states.columns)
-        if self.method == 'Chebyshev' or self.method == 'Legendre':
-            self.data_norm, self.L, self.U = normalization(data_states)
+        # Preserve the *original* state column order from the user input
+        orig_state_cols = [c for c in self.data.columns if c != time_col_name]
+        candidate_cols = [c for c in data.columns if c != time_col_name]
+        if all(c in candidate_cols for c in orig_state_cols) and len(orig_state_cols) > 0:
+            data_states = data.loc[:, orig_state_cols].copy()
+        else:
+            # Fallback: keep whatever order standardize_columns produced (excluding time)
+            data_states = data.loc[:, candidate_cols].copy()
+
+
+        self.features = list(data_states.columns)
+        #if self.method == 'Chebyshev' or self.method == 'Legendre':
+            #self.data_norm = normalization(data_states)[0]
+        print("features:", self.features, "n_vars=", len(self.features))
         return data_states, time
     
     def _recovered_model_monomial(self):
@@ -130,6 +389,9 @@ class Recover_Model_sindy:
             self.model = model
             model.fit(X,t=t)
             #model.fit(self.data_states,t = self.time)
+            if getattr(self, 'debug', False):
+                print("\n===== DIAG (monomial) =====")
+                self._diagnose_linear_alignment()
         else:
             model = ps.SINDy(
                 feature_library=feature_library,
@@ -138,10 +400,14 @@ class Recover_Model_sindy:
             )
             self.model = model
             model.fit(self.data_states,t=t,x_dot=self.Xdot)
+        if getattr(self, 'debug', False):
+            print("\n===== DIAG (monomial) =====")
+            self._diagnose_linear_alignment()
         eq_list = model.equations()
 
         states, rhs_raw = [], []
-        for var, eq in zip(model.feature_names, eq_list):
+        #for var, eq in zip(model.feature_names, eq_list):
+        for var, eq in zip(self.features, eq_list):
             states.append(f'd{var}/dt')
             rhs_raw.append(eq.strip())
         def clean(eq: str) -> str:
@@ -156,11 +422,10 @@ class Recover_Model_sindy:
         return df
     
     def _recovered_model_orthogonal(self):
-        if self.method == 'Chebyshev':
-            feature_library = OrthogonalLibrary(degree=self.poly_degree,method='Chebyshev')
-        elif self.method == 'Legendre':
-            feature_library = OrthogonalLibrary(degree=self.poly_degree,method='Legendre')
+        feature_library = OrthogonalLibrary(degree=self.poly_degree, method=self.method,
+                                            include_bias=True)
         optimizer = ps.STLSQ(threshold=self.threshold)
+        #optimizer = WhitenedOptimizer(base_optimizer)
         feature_names = self.features
 
         if self.Xdot is None:
@@ -172,7 +437,10 @@ class Recover_Model_sindy:
                 feature_names=feature_names
             )
             self.model = model
-            model.fit(self.data_norm,t=self.time)
+            model.fit(self.data_states, t=self.time)
+            if getattr(self, 'debug', False):
+                print("\n===== DIAG (orthogonal) =====")
+                self._diagnose_linear_alignment()
         else:
             model = ps.SINDy(
                 feature_library=feature_library,
@@ -180,15 +448,88 @@ class Recover_Model_sindy:
                 feature_names=feature_names
             )
             self.model = model
-            model.fit(self.data_norm,t=self.time,x_dot=self.Xdot)
+            model.fit(self.data_states, t=self.time, x_dot=self.Xdot)
+            if getattr(self, 'debug', False):
+                print("\n===== DIAG (orthogonal) =====")
+                self._diagnose_linear_alignment()
         eq_list = model.equations()
+        # Data-driven fix for potential library name↔column mismatch on linear tags
+        #eq_list = self._remap_legendre_linear_names_by_corr(eq_list)
+        print("len(eq_list)=", len(eq_list))
+        return self._orthogonal_converter(eq_list)
+    
+    def _recovered_model_orthogonal_OLS(self):
+        if self.method not in ('Chebyshev', 'Legendre'):
+            raise ValueError("_recovered_model_orthogonal_OLS only supports Chebyshev/Legendre.")
 
+        # 1) Build orthogonal features on normalized data
+        lib = OrthogonalLibrary(degree=self.poly_degree, method=self.method,include_bias=False)
+        # Fit/transform API expects a list of trajectories
+        lib.fit([self.data_states.values])
+        Phi = lib.transform([self.data_states.values])[0]  # shape (T, n_features)
+        feat_names = lib.get_feature_names(input_features=self.features)
+
+        # 2) Derivatives in the *same* space
+        t = np.asarray(self.time, dtype=float).reshape(-1)
+        if self.Xdot is None:
+            X_norm = np.asarray(self.data_states, dtype=float)
+            Xdot = np.gradient(X_norm, t, axis=0, edge_order=self.differential_order)
+        else:
+            # If user supplies Xdot, assume it's already aligned with data_norm order/shape
+            Xdot = np.asarray(self.Xdot, dtype=float)
+            if Xdot.shape[0] != Phi.shape[0]:
+                raise ValueError(f"Xdot length {Xdot.shape[0]} != number of samples {Phi.shape[0]}.")
+            if Xdot.shape[1] != len(self.features):
+                raise ValueError(f"Xdot has {Xdot.shape[1]} columns but there are {len(self.features)} state variables.")
+
+        # 3) OLS for each state derivative column
+        eq_list = []  # list of RHS strings, one per state in self.features order
+        Phi_mat = np.asarray(Phi, dtype=float)
+        # Solve Phi * beta_j ≈ Xdot[:, j]
+        for j, var in enumerate(self.features):
+            y = Xdot[:, j]
+            # lstsq returns (coef, residuals, rank, s)
+            beta, *_ = np.linalg.lstsq(Phi_mat, y, rcond=None)
+            # Optional small thresholding just to clean tiny numerical noise
+            beta[np.isclose(beta, 0, atol=1e-12)] = 0.0
+            # Build RHS string with explicit signed coefficients, no space after sign, no leading '+'
+            terms = []
+            for c, name in zip(beta, feat_names):
+                if not np.isfinite(c) or c == 0:
+                    continue
+                # Use explicit signed coefficient without a space after the sign to satisfy downstream parser
+                terms.append(f"{c:+.6g} {name.replace('*', ' ')}")
+            rhs = " ".join(terms).lstrip('+')  # drop only the first leading '+' if present
+            if rhs.strip() == "":
+                rhs = "0"
+            eq_list.append(rhs)
+
+        # 4) Convert to original polynomial basis and return formatted DataFrame
+        return self._orthogonal_converter(eq_list)
+
+    @staticmethod
+    def preprocess_eq(eq):
+        eq = eq.replace('^', '**')
+        # Convert "number space letter" or "number space variable" to an explicit multiplication sign
+        eq = re.sub(r'(?<=\d)\s+(?=[A-Za-z_])', '*', eq)
+        return eq
+
+    def _orthogonal_converter(self,eq_list):
         converter = OrthogonalToPolynomialConverter(max_degree=self.poly_degree, basis=self.method)
-        polynomial_model = converter.convert_sindy_model(eq_list)
+        polynomial_model = converter.convert_sindy_model(eq_list,self.features)
 
         denormalizer = EquationDenormalizer(self.L,self.U)
-        equation_list = [f"d{var}/dt = {poly._to_string()}" for var, poly in polynomial_model.items()]
-        original_equations = denormalizer.denormalize_equations(equation_list)
+        #equation_list = [f"d{var}/dt = {poly._to_string()}" for var, poly in polynomial_model.items()]
+
+        # Build equation_list in the exact self.features order
+        equation_list = []
+        for var in self.features:
+            poly = polynomial_model.get(var)
+            if poly is None:
+                continue
+            equation_list.append(f"d{var}/dt = {poly._to_string()}")
+        original_equations = equation_list
+        #original_equations = denormalizer.denormalize_equations(equation_list)
 
         # Parse original_equations of the form "dx/dt = ..." into {var: rhs}
         eq_map = {}
@@ -216,7 +557,23 @@ class Recover_Model_sindy:
                 else:
                     rhs_raw.append('')
                 states.append(f'd{var}/dt')
-        
+
+        # Scale each equation by (U - L)/2 for its corresponding state and expand
+        #scaled_rhs_raw = []
+        #for i, eq in enumerate(rhs_raw):
+            #var = self.features[i]
+            #scale = (self.U[var] - self.L[var]) / 2
+            #try:
+                #pre = self.preprocess_eq(eq)
+                #expr = sp.sympify(pre, evaluate=False)
+                #expr = expand(expr)
+                #scaled_expr = expand(scale * expr)
+                #scaled_eq = str(simplify(scaled_expr))
+            #except Exception:
+                # Fallback to explicit multiplication string if sympy parsing fails
+                #scaled_eq = f"{scale}*({eq})"
+            #scaled_rhs_raw.append(scaled_eq)
+
         def clean(eq: str) -> str:
             eq = re.sub(r'\+\s+-', '- ', eq)
             eq = re.sub(r'\s+', ' ', eq).strip()
@@ -227,6 +584,158 @@ class Recover_Model_sindy:
             'Equation': rhs
         })
         return df
+
+    def _expand_brackets(self,equation):
+        equation = equation.replace(' ','')
+        equation = self._protect_function_parentheses(equation)
+        # Expand brackets in the equation like 0.5*(x1+x2) -> 0.5*x1+0.5*x2
+        while '(' in equation:
+            start = -1
+            for i,char in enumerate(equation):
+                if char == '(':
+                    start = i
+                elif char == ')' and start != -1:
+                    bracket_content = equation[start+1:i]
+
+                    coeff_start = self._find_coefficient_start(equation, start)
+                    coefficient_part = equation[coeff_start:start]
+                    expanded = self._expand_single_bracket(coefficient_part,bracket_content)
+                    equation = equation[:coeff_start] + expanded + equation[i+1:]
+                    break
+        equation = self._restore_function_parentheses(equation)
+
+        return equation
+    
+    def _protect_function_parentheses(self,equation):
+        function_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\(([^()]*)\)'
+        self.function_substitutions = {}
+        counter = 0
+        while re.search(function_pattern, equation):
+            match = re.search(function_pattern, equation)
+            if match:
+                full_func = match.group(0)
+                placeholder = f'__FUNC_{counter}__'
+                self.function_substitutions[placeholder] = full_func
+                equation = equation.replace(full_func, placeholder, 1)
+                counter += 1
+
+        return equation
+    
+    def _restore_function_parentheses(self, equation):
+        if hasattr(self, 'function_substitutions'):
+            for placeholder, original in self.function_substitutions.items():
+                equation = equation.replace(placeholder, original)
+
+        return equation
+
+    def _find_coefficient_start(self, equation, bracket_start):
+            """Coefficient starting position search"""
+            i = bracket_start - 1
+            
+            # Search forward until an operator or the beginning of a string is encountered
+            while i >= 0:
+                char = equation[i]
+                if char in '+-' and i != bracket_start - 1:
+                    # If it is a symbol and not immediately adjacent to a bracket, stop
+                    if i == 0 or equation[i-1] in '+-*/':
+                        # This is a single symbol
+                        break
+                    else:
+                        # This could be part of the expression
+                        i -= 1
+                elif char in '*/':
+                    i -= 1
+                elif char.isalnum() or char in '._':
+                    i -= 1
+                else:
+                    break
+            
+            return i + 1 if i >= 0 else 0
+    
+    def _expand_single_bracket(self, coefficient, bracket_content):
+        """Single bracket expansion"""
+        # Split bracket contents
+        bracket_terms = self._split_equation_terms(bracket_content)
+        
+        # Treatment coefficient
+        coeff = coefficient.strip()
+        if coeff.endswith('*'):
+            coeff = coeff[:-1]
+        
+        # Processing Symbols
+        coeff_sign = 1
+        coeff_value = coeff
+        
+        if coeff.startswith('-'):
+            coeff_sign = -1
+            coeff_value = coeff[1:] if len(coeff) > 1 else ""
+        elif coeff.startswith('+'):
+            coeff_value = coeff[1:] if len(coeff) > 1 else ""
+        
+        # Expand each item
+        expanded_terms = []
+        for term in bracket_terms:
+            term = term.strip()
+            term_sign = 1
+            
+            if term.startswith('+'):
+                term = term[1:]
+            elif term.startswith('-'):
+                term_sign = -1
+                term = term[1:]
+            
+            final_sign = coeff_sign * term_sign
+            
+            # Build expansion items
+            if coeff_value:
+                if final_sign == -1:
+                    expanded_term = '-' + coeff_value + '*' + term
+                else:
+                    expanded_term = coeff_value + '*' + term
+            else:
+                if final_sign == -1:
+                    expanded_term = '-' + term
+                else:
+                    expanded_term = term
+            
+            expanded_terms.append(expanded_term)
+        
+        # Connection Item
+        result = ''
+        for i, term in enumerate(expanded_terms):
+            if i == 0:
+                result = term
+            else:
+                if term.startswith('-'):
+                    result += term
+                else:
+                    result += '+' + term
+        
+        return result
+    
+    def _split_equation_terms(self,equation:str):
+        # Split equation into without preserving signs.
+        terms = []
+        current_term = ""
+
+        i = 0
+        while i < len(equation):
+            char = equation[i]
+            if char == '+' or char == '-':
+                if current_term:
+                    terms.append(current_term)
+                if char == '-':
+                    current_term = '-'
+                else:
+                    current_term = ''
+            else:
+                current_term += char
+            i += 1
+        
+        if current_term:
+            terms.append(current_term)
+
+        return terms
 
     def _plot_pareto(self):
         """Compute Pareto-like curves of error vs threshold.
