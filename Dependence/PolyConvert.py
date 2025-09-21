@@ -53,11 +53,11 @@ class MultivariatePolynomial:
         "Right multiplication (scaler * polynomial)"
         return self.__mul__(other)
     
-    def _simplify(self,tolerance=1e-27):
+    def _simplify(self,tolerance=1e-12):
         """Simplify the polynomial by removing terms with coefficients close to zero"""
         self.terms = {k: v for k,v in self.terms.items() if abs(v) > tolerance}
 
-    def _to_string(self,tolerance=1e-27,precision=6):
+    def _to_string(self,tolerance=1e-12,precision=6):
         """Convert to a readable string"""
         if not self.terms:
             return "0"
@@ -110,13 +110,16 @@ class MultivariatePolynomial:
     
 
 class OrthogonalToPolynomialConverter:
-    def __init__(self, max_degree, basis: str = 'Legendre'):
+    def __init__(self, max_degree, basis: str = 'Legendre', simplify_tol: float = 1e-12, print_tol: float = 1e-12, print_precision: int = 6):
         self.max_degree = max_degree
         self.basis = basis.capitalize()
         if self.basis not in ('Chebyshev', 'Legendre'):
             raise ValueError(f"Unsupported basis '{basis}'. Use 'Chebyshev' or 'Legendre'.")
         self._chebyshev_cache = {}
         self._legendre_cache = {}
+        self.simplify_tol = float(simplify_tol)
+        self.print_tol = float(print_tol)
+        self.print_precision = int(print_precision)
         if self.basis == 'Chebyshev':
             self._precompute_chebyshev_polynomials()
         else:
@@ -137,7 +140,7 @@ class OrthogonalToPolynomialConverter:
                 self._chebyshev_cache[n][power] -= coeff
             # Clean up coefficients close to zero
             self._chebyshev_cache[n] = {k: v for k,v in self._chebyshev_cache[n].items()
-                                        if abs(v) > 1e-27}
+                                        if abs(v) > 1e-12}
 
     def _precompute_legendre_polynomials(self):
         # P_0(x) = 1
@@ -157,7 +160,7 @@ class OrthogonalToPolynomialConverter:
             for power in list(next_poly.keys()):
                 next_poly[power] /= (n + 1)
             # cleanup
-            self._legendre_cache[n+1] = {k: v for k, v in next_poly.items() if abs(v) > 1e-27}
+            self._legendre_cache[n+1] = {k: v for k, v in next_poly.items() if abs(v) > 1e-12}
     
     def _get_univariate_poly(self, degree, variable: str) -> MultivariatePolynomial:
         """Get the polynomial corresponding to T_n(variable) or P_n(variable) depending on basis."""
@@ -173,15 +176,87 @@ class OrthogonalToPolynomialConverter:
         return poly
     
     def _parse_sindy_equation(self,equation_str:str) -> Tuple[str, str]:
-        """Parse the SINDy equation string and return (left side, right side)"""
-        parts = equation_str.split(' = ')
-        if len(parts) != 2:
-            raise ValueError("Invalid equation format")
-        rhs = parts[0].strip()
-        lhs = parts[1].strip()
-        return rhs, lhs
+        """Parse the SINDy equation string and return (left side, right side).
+        Robust to spaces around '=' and to additional '=' in RHS (joins back)."""
+        if not isinstance(equation_str, str):
+            equation_str = str(equation_str)
+        parts = equation_str.split('=')
+        if len(parts) < 2:
+            raise ValueError(f"Invalid equation format: {equation_str}")
+        lhs = parts[0].strip()
+        rhs = '='.join(parts[1:]).strip()
+        return lhs, rhs
+
+    def _extract_derivative_var_from_lhs(self, lhs: str):
+        """Try to extract variable name from LHS like 'dx1/dt' or 'd(x1)/dt'.
+        Fallback to a '(var)' pattern if present. Return None if not found."""
+        lhs = lhs.strip()
+        # dvar/dt
+        m = re.fullmatch(r"d\s*([^/()\s]+)\s*/\s*dt", lhs)
+        if m:
+            return m.group(1)
+        # d(var)/dt
+        m = re.fullmatch(r"d\s*\(([^()]+)\)\s*/\s*dt", lhs)
+        if m:
+            return m.group(1)
+        # Legacy: any '(var)'
+        m = re.search(r"\(([^)]+)\)", lhs)
+        if m:
+            return m.group(1)
+        return None
     
     def _parse_orthogonal_term(self, term_str) -> Tuple[float, List[Tuple[str, int]]]:
+        """
+        Parse a term like `alpha T_1(x3) T_2(x1)` (Chebyshev) or `alpha P_1(x3) P_2(x1)` (Legendre).
+        Returns (coefficient, [(variable, degree), ...])
+        """
+        if isinstance(term_str, list):
+            term_str = ' '.join(str(item) for item in term_str)
+        if not isinstance(term_str, str):
+            term_str = str(term_str)
+        term_str = term_str.strip()
+
+        symbol = 'T_' if self.basis == 'Chebyshev' else 'P_'
+        t_match = re.search(symbol, term_str)
+        
+        if t_match:
+            coeff_str = term_str[:t_match.start()].strip()
+            basis_part = term_str[t_match.start():].strip()
+        else:
+            # No basis functions present -> constant term
+            # FIX: Handle formats like "-0.039 1" by removing trailing "1" or "* 1"
+            term_cleaned = re.sub(r'\s*\*?\s*1\s*$', '', term_str)
+            
+            try:
+                # Try to parse the cleaned version first
+                if term_cleaned and term_cleaned != term_str:
+                    coeff = float(term_cleaned)
+                else:
+                    coeff = float(term_str)
+                return coeff, []
+            except ValueError:
+                raise ValueError(f"Cannot parse term: {term_str}")
+
+        # coefficient parsing
+        if coeff_str in ('', '+'):
+            coefficient = 1.0
+        elif coeff_str == '-':
+            coefficient = -1.0
+        else:
+            try:
+                coefficient = float(coeff_str)
+            except ValueError:
+                raise ValueError(f"Invalid coefficient: {coeff_str}")
+
+        # basis function occurrences
+        pattern = r'T_(\d+)\(([^)]+)\)' if self.basis == 'Chebyshev' else r'P_(\d+)\(([^)]+)\)'
+        matches = re.findall(pattern, basis_part)
+        basis_terms: List[Tuple[str, int]] = []
+        for degree_str, variable in matches:
+            basis_terms.append((variable, int(degree_str)))
+        
+        return coefficient, basis_terms
+    #def _parse_orthogonal_term(self, term_str) -> Tuple[float, List[Tuple[str, int]]]:
         """
         Parse a term like `alpha T_1(x3) T_2(x1)` (Chebyshev) or `alpha P_1(x3) P_2(x1)` (Legendre).
         Returns (coefficient, [(variable, degree), ...])
@@ -278,12 +353,10 @@ class OrthogonalToPolynomialConverter:
         # Extract all variables
         all_variables = set()
         for eq in equations:
-            # From lhs
             lhs, rhs = self._parse_sindy_equation(eq)
-            var_match = re.search(r'\((.*?)\)', lhs)
-            if var_match:
-                derivative_var = var_match.group(1)
-                all_variables.add(derivative_var)
+            dv = self._extract_derivative_var_from_lhs(lhs)
+            if dv:
+                all_variables.add(dv)
             # From rhs
             pattern = r'T_\d+\(([^)]+)\)' if self.basis == 'Chebyshev' else r'P_\d+\(([^)]+)\)'
             variables = re.findall(pattern, rhs)
@@ -294,11 +367,9 @@ class OrthogonalToPolynomialConverter:
         # Handle every equation
         for eq in equations:
             lhs, rhs = self._parse_sindy_equation(eq)
-            var_match = re.search(r'\((.*?)\)', lhs)
-            if not var_match:
+            derivative_var = self._extract_derivative_var_from_lhs(lhs)
+            if derivative_var is None:
                 continue
-            derivative_var = var_match.group(1)
-
             result_poly = self._convert_rhs(rhs, all_variables)
             results[derivative_var] = result_poly
 
@@ -346,7 +417,7 @@ class OrthogonalToPolynomialConverter:
             except Exception as e:
                 print(f"Warning: Cannot parse '{term}':{e}")
                 continue
-        result_poly._simplify()
+        result_poly._simplify(getattr(self, 'simplify_tol', 1e-12))
         return result_poly
     
     def _split_equation_terms(self,equation_str:str) -> List[str]:
@@ -376,7 +447,7 @@ class OrthogonalToPolynomialConverter:
     
     def _print_model(self,polynomial_model: Dict[str, MultivariatePolynomial]):
         for var, poly in polynomial_model.items():
-            print(f"d{var}/dt = {poly._to_string()}")
+            print(f"d{var}/dt = {poly._to_string(tolerance=getattr(self,'print_tol',1e-12), precision=getattr(self,'print_precision',6))}")
 
 
 class EquationDenormalizer:
