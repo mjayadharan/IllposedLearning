@@ -113,27 +113,34 @@ class Lotka_Volterra:
             })
         else:
             x_base = sol.y[0]
-            y_base = sol.y[1]
+            y1_base = sol.y[1]
+            y2_base = sol.y[2]
 
             x_sigma = np.abs(x_base) * self.noise_level
-            y_sigma = np.abs(y_base) * self.noise_level
+            y1_sigma = np.abs(y1_base) * self.noise_level
+            y2_sigma = np.abs(y2_base) * self.noise_level
             x_noisy = x_base + np.random.normal(0,x_sigma)
-            y_noisy = y_base + np.random.normal(0,y_sigma)
+            y1_noisy = y1_base + np.random.normal(0, y1_sigma)
+            y2_noisy = y2_base + np.random.normal(0, y2_sigma)
 
             # Computer derivatives
             dxdt_vals = []
-            dydt_vals = []
-            for t, xn, yn in zip(sol.t, x_noisy, y_noisy):
-                dxdt, dydt = self.lv_rhs(t, [xn, yn])
+            dy1dt_vals = []
+            dy2dt_vals = []
+            for t, xn, y1n, y2n in zip(sol.t, x_noisy, y1_noisy, y2_noisy):
+                dxdt, dy1dt, dy2dt = self.lv_rhs_1_2(t, [xn, y1n, y2n])
                 dxdt_vals.append(dxdt)
-                dydt_vals.append(dydt)
+                dy1dt_vals.append(dy1dt)
+                dy2dt_vals.append(dy2dt)
 
             df = pd.DataFrame({
                 "time": sol.t,
                 "x": x_noisy,
-                "y": y_noisy,
+                "y1": y1_noisy,
+                "y2": y2_noisy,
                 "dxdt": dxdt_vals,
-                "dydt": dydt_vals
+                "dy1dt": dy1dt_vals,
+                "dy2dt": dy2dt_vals
             })
 
         return df
@@ -150,7 +157,6 @@ class CRN:
 
     def toyEnzRHS(self, y, t):
         # Unpack states, params
-        # Rename ES as G
         S, E, ES, P = y
         k, kr, kcat = self.k_rates.get("k"), self.k_rates.get("kr"), self.k_rates.get("kcat")
 
@@ -186,11 +192,11 @@ class CRN:
                 "S": S_base,
                 'E': E_base,
                 "ES": ES_base,
-                "P": P_base,
-                "dSdt": dS_dt,
-                "dEdt": dE_dt,
-                "dESdt": dES_dt,
-                "dPdt": dP_dt
+                "P": P_base
+                #"dSdt": dS_dt,
+                #"dEdt": dE_dt,
+                #"dESdt": dES_dt,
+                #"dPdt": dP_dt
             })
 
         else:
@@ -199,10 +205,11 @@ class CRN:
             ES_sigma = np.abs(ES_base) * self.noise_level
             P_sigma = np.abs(P_base) * self.noise_level
 
-            S_noisy = S_base + np.random.normal(0,S_sigma)
-            E_noisy = E_base + np.random.normal(0,E_sigma)
-            ES_noisy = S_base + np.random.normal(0,ES_sigma)
-            P_noisy = S_base + np.random.normal(0,P_sigma)
+            rng = np.random.default_rng(0)
+            S_noisy = S_base + rng.normal(0,S_sigma)
+            E_noisy = E_base + rng.normal(0,E_sigma)
+            ES_noisy = S_base + rng.normal(0,ES_sigma)
+            P_noisy = S_base + rng.normal(0,P_sigma)
 
             # Computer derivatives
             dS_dt = []
@@ -221,11 +228,11 @@ class CRN:
                 "S": S_noisy,
                 'E': E_noisy,
                 "ES": ES_noisy,
-                "P": P_noisy,
-                "dSdt": dS_dt,
-                "dEdt": dE_dt,
-                "dESdt": dES_dt,
-                "dPdt": dP_dt
+                "P": P_noisy
+                #"dSdt": dS_dt,
+                #"dEdt": dE_dt,
+                #"dESdt": dES_dt,
+                #"dPdt": dP_dt
             })
 
         return df
