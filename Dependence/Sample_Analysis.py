@@ -678,7 +678,7 @@ class sampling:
                 sigma = np.abs(result[self.ID]) * nl
                 result.loc[:, self.ID] = result[self.ID] + rng.normal(0.0, sigma)
                 # result.loc[:, self.ID] = result[self.ID].clip(lower=0)
-            
+
         elif self.distribution.lower() == 'arcsine':
             eps = 1e-7
             # Clip the edge
@@ -693,10 +693,11 @@ class sampling:
             widths = np.diff(edges)
             log_p = np.zeros(N)
             for j in range(d):
-                counts, _ = np.histogram(Xn[:, j], bins=edges)
+                counts, _ = np.histogram(Xn.to_numpy()[:, j], bins=edges)
+                #counts, _ = np.histogram(Xn[:, j], bins=edges)
                 dens = counts / (N * widths[0])
                 dens = np.maximum(dens, 1e-12) # floor
-                bj = np.clip(np.searchsorted(edges, Xn[:, j], side='right')-1, 0, n_bins-1)
+                bj = np.clip(np.searchsorted(edges, Xn.to_numpy()[:, j], side='right') - 1, 0, n_bins - 1)
                 log_p += np.log(dens[bj])
 
             log_w = log_t - log_p
