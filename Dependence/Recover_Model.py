@@ -170,8 +170,8 @@ class WhitenedOptimizer:
         return getattr(self.base, name)
     
 class Recover_Model_sindy:
-    def __init__(self,data,differential_order,poly_degree,threshold,
-                 threshold_scan=None,Xdot=None,method='Monomial',L=None,U=None,debug=True):
+    def __init__(self,data,differential_order,poly_degree,threshold,method,
+                 threshold_scan=None,Xdot=None,L=None,U=None,debug=True):
         # data: DataFrame -- contains all columns including states and time
         # for orthogonal basis, the data should have been normalized
         # method: basis library used, the default one is monomial library
@@ -191,6 +191,9 @@ class Recover_Model_sindy:
         self.data_states, self.time = self._preprocess()
         self.features = list(self.data_states.columns)
 
+        #if self.method == 'Legendre' or 'Chebyshev':
+            #self.data_norm = normalization(self.data_states)[0]
+
         if self.method == 'Monomial':
             self.model_expression = self._recovered_model_monomial()
         else:
@@ -202,7 +205,7 @@ class Recover_Model_sindy:
         Products like 'P_1(xi) P_1(xj)' are left untouched.
         This is purely data-driven and does not inject model priors.
         """
-        if self.method != 'Legendre':
+        if self.method != 'Chebyshev':
             return eq_list
         mdl = getattr(self, 'model', None)
         if mdl is None:
@@ -280,7 +283,7 @@ class Recover_Model_sindy:
         # 1) Name and Sequence Alignment Check
         model_names = list(getattr(mdl, 'feature_names_', self.features))
         if model_names != self.features:
-            print("[DIAG][WARN] self.features 与 model.feature_names_ Sequence inconsistency:\n\tself.features=", self.features, "\n\tmodel.feature_names_=", model_names)
+            print("[DIAG][WARN] self.features and model.feature_names_ Sequence inconsistency:\n\tself.features=", self.features, "\n\tmodel.feature_names_=", model_names)
         else:
             print("[DIAG] feature name order OK ✓")
 
@@ -360,7 +363,6 @@ class Recover_Model_sindy:
             # Fallback: keep whatever order standardize_columns produced (excluding time)
             data_states = data.loc[:, candidate_cols].copy()
 
-
         self.features = list(data_states.columns)
         #if self.method == 'Chebyshev' or self.method == 'Legendre':
             #self.data_norm = normalization(data_states)[0]
@@ -372,10 +374,6 @@ class Recover_Model_sindy:
         feature_library = ps.PolynomialLibrary(self.poly_degree,include_bias=False)
         optimizer = ps.STLSQ(threshold=self.threshold)
         feature_names = self.features
-
-        X = np.array(self.data_states, dtype=np.float64)
-        t = np.array(self.time, dtype=np.float64).reshape(-1)
-        dt = t[1] - t[0]
         
         if self.Xdot is None:
             differential_method = ps.FiniteDifference(self.differential_order)
@@ -387,11 +385,11 @@ class Recover_Model_sindy:
                 feature_names = feature_names
             )
             self.model = model
-            model.fit(X,t=t)
+            model.fit(self.data_states, t=self.time, x_dot=self.Xdot)
             #model.fit(self.data_states,t = self.time)
-            if getattr(self, 'debug', False):
-                print("\n===== DIAG (monomial) =====")
-                self._diagnose_linear_alignment()
+            #if getattr(self, 'debug', False):
+                #print("\n===== DIAG (monomial) =====")
+                #self._diagnose_linear_alignment()
         else:
             model = ps.SINDy(
                 feature_library=feature_library,
@@ -399,10 +397,10 @@ class Recover_Model_sindy:
                 feature_names=feature_names
             )
             self.model = model
-            model.fit(self.data_states,t=t,x_dot=self.Xdot)
-        if getattr(self, 'debug', False):
-            print("\n===== DIAG (monomial) =====")
-            self._diagnose_linear_alignment()
+            model.fit(self.data_states,t=self.time,x_dot=self.Xdot)
+        #if getattr(self, 'debug', False):
+            #print("\n===== DIAG (monomial) =====")
+            #self._diagnose_linear_alignment()
         eq_list = model.equations()
 
         states, rhs_raw = [], []
@@ -438,9 +436,9 @@ class Recover_Model_sindy:
             )
             self.model = model
             model.fit(self.data_states, t=self.time)
-            if getattr(self, 'debug', False):
-                print("\n===== DIAG (orthogonal) =====")
-                self._diagnose_linear_alignment()
+            #if getattr(self, 'debug', False):
+                #print("\n===== DIAG (orthogonal) =====")
+                #self._diagnose_linear_alignment()
         else:
             model = ps.SINDy(
                 feature_library=feature_library,
@@ -449,9 +447,9 @@ class Recover_Model_sindy:
             )
             self.model = model
             model.fit(self.data_states, t=self.time, x_dot=self.Xdot)
-            if getattr(self, 'debug', False):
-                print("\n===== DIAG (orthogonal) =====")
-                self._diagnose_linear_alignment()
+            #if getattr(self, 'debug', False):
+                #print("\n===== DIAG (orthogonal) =====")
+                #self._diagnose_linear_alignment()
         eq_list = model.equations()
         # Data-driven fix for potential library name↔column mismatch on linear tags
         #eq_list = self._remap_legendre_linear_names_by_corr(eq_list)
@@ -465,7 +463,7 @@ class Recover_Model_sindy:
         # 1) Build orthogonal features on normalized data
         lib = OrthogonalLibrary(degree=self.poly_degree, method=self.method,include_bias=False)
         # Fit/transform API expects a list of trajectories
-        lib.fit([self.data_states.values])
+        lib.fit([self.data_norm.values])
         Phi = lib.transform([self.data_states.values])[0]  # shape (T, n_features)
         feat_names = lib.get_feature_names(input_features=self.features)
 
@@ -559,20 +557,20 @@ class Recover_Model_sindy:
                 states.append(f'd{var}/dt')
 
         # Scale each equation by (U - L)/2 for its corresponding state and expand
-        #scaled_rhs_raw = []
-        #for i, eq in enumerate(rhs_raw):
-            #var = self.features[i]
-            #scale = (self.U[var] - self.L[var]) / 2
-            #try:
-                #pre = self.preprocess_eq(eq)
-                #expr = sp.sympify(pre, evaluate=False)
-                #expr = expand(expr)
-                #scaled_expr = expand(scale * expr)
-                #scaled_eq = str(simplify(scaled_expr))
-            #except Exception:
+        scaled_rhs_raw = []
+        for i, eq in enumerate(rhs_raw):
+            var = self.features[i]
+            scale = (self.U[var] - self.L[var]) / 2
+            try:
+                pre = self.preprocess_eq(eq)
+                expr = sp.sympify(pre, evaluate=False)
+                expr = expand(expr)
+                scaled_expr = expand(scale * expr)
+                scaled_eq = str(simplify(scaled_expr))
+            except Exception:
                 # Fallback to explicit multiplication string if sympy parsing fails
-                #scaled_eq = f"{scale}*({eq})"
-            #scaled_rhs_raw.append(scaled_eq)
+                scaled_eq = f"{scale}*({eq})"
+            scaled_rhs_raw.append(scaled_eq)
 
         def clean(eq: str) -> str:
             eq = re.sub(r'\+\s+-', '- ', eq)
