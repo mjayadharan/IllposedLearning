@@ -181,11 +181,13 @@ class create_initial_conditions:
         L_wide, U_wide = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
 
         # Map to original ranges (widened if necessary)
-        Lo, Uo = L_wide.values, U_wide.values
+        Lo, Uo = self.L_orig.values, self.U_orig.values
+        #Lo, Uo = L_wide.values, U_wide.values
         X_orig = Lo + u01 * (Uo - Lo)
 
         # Also return a normalized representation spanning [-1, 1] regardless of data ranges
         X_norm = 2.0 * u01 - 1.0
+        X_norm = np.clip(X_norm, -1 + 1e-7, 1 - 1e-7)
 
         return pd.DataFrame(X_orig, columns=cols), pd.DataFrame(X_norm, columns=cols)
     
@@ -203,7 +205,8 @@ class create_initial_conditions:
 
         # Safely widen degenerate columns for mapping back to original scale
         L_wide, U_wide = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
-        Lo, Uo = L_wide.values, U_wide.values
+        Lo, Uo = self.L_orig.values, self.U_orig.values
+        #Lo, Uo = L_wide.values, U_wide.values
 
         # Map arcsine sample x ∈ [-1,1] to original ranges
         X_orig = 0.5 * (x + 1.0) * (Uo - Lo) + Lo
@@ -216,17 +219,20 @@ class sampling:
     This class is used for sampling under different initial conditions and finally deriving the time series 
     distributed as a specific distribution.
     """
-    def __init__(self,data,num,distribution='uniform',normalize=True):
+    def __init__(self, data, num, distribution='uniform', noise_level=None):
+        # data: original dataframe including time and states columns, 
+        # they are not necessary standardized or normalized.
         # num: how many initial conditions are expected to be generated
         # n_step: how many steps are expected to simulated
         self.data = data
         self.num = num
         self.distribution = distribution
-        self.normalize = normalize
+        self.noise_level = noise_level
 
-        Creator = create_initial_conditions(self.data,self.num,self.distribution)
+        Creator = create_initial_conditions(self.data, self.num, self.distribution)
         #self.sample_orig = Creator.sample_orig
         self.L_orig, self.U_orig = Creator.L_orig, Creator.U_orig
+        self.sample_orig = Creator.sample_orig
         self.sample_norm = Creator.sample_norm
         self.data_states = Creator.data_states
         self.time_col = Creator.time_col
@@ -358,12 +364,12 @@ class sampling:
         self.ID = species_ids
 
         # Build IC table aligned *positionally* to the species order to avoid label mismatches
-        if len(self.sample_norm.columns) != len(species_ids):
+        if len(self.sample_orig.columns) != len(species_ids):
             raise ValueError(
-                f"Column mismatch: {len(self.sample_norm.columns)} columns vs {len(species_ids)} species (IDs: {species_ids})."
+                f"Column mismatch: {len(self.sample_orig.columns)} columns vs {len(species_ids)} species (IDs: {species_ids})."
                 " Make sure your input data has the same number of state columns as floating species."
             )
-        ic_df = self.sample_norm.copy()
+        ic_df = self.sample_orig.copy()
         # Ensure exact order and names match species_ids
         ic_df.columns = species_ids
 
@@ -442,21 +448,18 @@ class sampling:
                     f"Selections were: {rr.timeCourseSelections}"
                 )
 
-            # Compute rates by setting states in the same positional order
-            rates_list = []
-            for t in range(len(df)):
-                state_vals = df.loc[t, species_ids].to_numpy()
-                for s, v in zip(species_ids, state_vals):
-                    rr[s] = float(v)
-                rates = rr.getRatesOfChange()
-                rates_list.append(rates)
+            # Only save the state trajectories (no derivatives here)
+            # Optional: add relative (heteroscedastic) noise: sigma = |value| * noise_level
+            if hasattr(self, 'noise_level') and self.noise_level is not None:
+                nl = float(self.noise_level)
+                rng = np.random.default_rng(0)
+                sigma = np.abs(df[species_ids]) * nl
+                df.loc[:, species_ids] = df[species_ids] + rng.normal(0.0, sigma)
+                # Optional floor to avoid zero-sigma at exact zeros:
+                # eps = 0.0; sigma = np.maximum(np.abs(df[species_ids]) * nl, eps)
 
-            derivative_df = pd.DataFrame(rates_list, columns=[f'd{s}/dt' for s in species_ids])
-            data_augmented = pd.concat([df, derivative_df], axis=1)
-
-            # Save
             fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
-            data_augmented.to_excel(fp, index=False)
+            df.to_excel(fp, index=False)
             filepaths.append(fp)
 
         return filepaths
@@ -484,11 +487,13 @@ class sampling:
               - noise_level: float or None
               - state_names: list[str] giving the model's internal state names
                 (default ["S","E","ES","P"]).
+              - method: Monomial, Legendre and Chebyshev. This input determines
+                whether the sampled data need to be normalized or not.
         """
         out_dir, tag = self._prepare_outdir(out_path, n_step, filename_prefix)
 
         # Use the standardized names coming from create_initial_conditions, e.g. ['x1','x2', ...]
-        std_names = list(self.sample_norm.columns)
+        std_names = list(self.sample_orig.columns)
         self.ID = std_names  # downstream methods rely on this
 
         # Time grid
@@ -499,8 +504,8 @@ class sampling:
 
         if model_name.lower() == 'lotka-volterra':
             # Map standardized names (x1,x2,...) to the Base_test internal names (x,y)
+            #model_state_names = model_kwargs.get('state_names', ["x","y"])  # order matters
             model_state_names = model_kwargs.get('state_names', ["x", "y1","y2"])  # order matters
-            #model_state_names = model_kwargs.get('state_names', ["x", "y"])  # order matters
             if len(model_state_names) != 3:
                 raise ValueError("Lotka-Volterra expects exactly 3 model state names.")
             if len(std_names) < 3:
@@ -508,81 +513,117 @@ class sampling:
 
             # Build a consistent mapping between model names and standardized names, in order
             model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
-            std_in_model_order = [model_to_std[m] for m in model_state_names]  # e.g. ['x1','x2']
+            std_in_model_order = [model_to_std[m] for m in model_state_names]  # e.g. ['x1','x2','x3']
 
             params = model_kwargs.get('params')
+            method = model_kwargs.get('method')
             if params is None:
                 raise ValueError("'params' must be provided for Lotka-Volterra in model_kwargs.")
             noise_level = model_kwargs.get('noise_level', None)
 
-            for k in range(len(self.sample_norm)):
-                row = self.sample_norm.iloc[k]
-                # Initial condition in the model's variable order (x,y)
-                z0= [float(row[s]) for s in std_in_model_order]
+            if method == 'Monomial': 
+                for k in range(len(self.sample_orig)):
+                    row = self.sample_orig.iloc[k]
+                    # Initial condition in the model's variable order (x,y)
+                    z0= [float(row[s]) for s in std_in_model_order]
 
-                # Simulate via the Base_test class
-                lv = Lotka_Volterra(params=params, t_span=t_span, t_eval=t_eval, z0=z0, noise_level=noise_level)
-                df_raw = lv.data_sim.copy()  # columns: ['time','x','y']
+                    # Simulate via the Base_test class
+                    lv = Lotka_Volterra(params=params, t_span=t_span, t_eval=t_eval, z0=z0, noise_level=noise_level)
+                    df_raw = lv.data_sim.copy()  # columns: ['time','x','y1','y2']
 
-                # Rename model outputs (x,y) -> standardized names (x1,x2) for consistency with the rest of the pipeline
-                rename_map = {m: model_to_std[m] for m in model_state_names}
-                df = df_raw.rename(columns=rename_map)
+                    # Rename model outputs to standardized names for consistency
+                    rename_map = {m: model_to_std[m] for m in model_state_names}
+                    rename_map.update({'time': 'time'})
+                    df = df_raw.rename(columns=rename_map)
 
-                # Compute derivative at each time using the model RHS, feeding values in (x,y) order
-                deriv = []
-                for i in range(len(df)):
-                    t = float(df.loc[i, 'time']) if 'time' in df.columns else float(t_eval[i])
-                    # Values in model order
-                    state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
-                    dstate = lv.lv_rhs_1_2(t, state_vec_model_order)
-                    deriv.append(dstate)
-                deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
+                    # Only save the state trajectories (no derivatives here)
+                    fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
+                    df.to_excel(fp, index=False)
+                    filepaths.append(fp)
+            else:
+                for k in range(len(self.sample_orig)):
+                    row = self.sample_orig.iloc[k]
+                    # Initial condition in the model's variable order (x,y)
+                    z0= [float(row[s]) for s in std_in_model_order]
 
-                data_augmented = pd.concat([df, deriv_df], axis=1)
-                fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
-                data_augmented.to_excel(fp, index=False)
-                filepaths.append(fp)
+                    # Simulate via the Base_test class
+                    lv = Lotka_Volterra(params=params, t_span=t_span, t_eval=t_eval, z0=z0, noise_level=noise_level)
+                    df_raw = lv.data_sim.copy()  # columns: ['time','x','y1','y2']
+
+                    # Rename model outputs to standardized names for consistency
+                    rename_map = {m: model_to_std[m] for m in model_state_names}
+                    rename_map.update({'time': 'time'})
+                    df = df_raw.rename(columns=rename_map)
+
+                    state_cols = [c for c in df.columns if c != 'time']
+                    df_states_norm = normalization(df[state_cols], self.L_orig, self.U_orig)[0]
+                    df_norm = pd.concat([df[['time']], df_states_norm], axis=1)
+
+                    # Only save the state trajectories (no derivatives here)
+                    fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
+                    df_norm.to_excel(fp, index=False)
+                    filepaths.append(fp)
+
 
         elif model_name.lower() == 'crn':
-            model_state_names = model_kwargs.get('state_names', ["S","E","G","P"])
-
-            # Build a consistent mapping between model names and standardized names, in order
+            model_state_names = model_kwargs.get('state_names', ["S","E","ES","P"])
             model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
-            std_in_model_order = [model_to_std[m] for m in model_state_names]  # e.g. ['x1','x2','x3','x4']
+            std_in_model_order = [model_to_std[m] for m in model_state_names]
 
             k_rates = model_kwargs.get('k_rates')
+            method = model_kwargs.get('method')
             if k_rates is None:
                 raise ValueError("'k_rates' must be provided for Chemical Reaction Network in model_kwargs.")
             noise_level = model_kwargs.get('noise_level', None)
 
-            for k in range(len(self.sample_norm)):
-                row = self.sample_norm.iloc[k]
-                #row.iloc[2] = 0
-                # Initial condition in the model's variable order (x,y)
-                init_cond = [float(row[s]) for s in std_in_model_order]
+            if method == 'Monomial':
+                for k in range(len(self.sample_orig)):
+                    row = self.sample_orig.iloc[k]
+                    init_cond = [float(row[s]) for s in std_in_model_order]
 
-                # Simulate via the Base_test class
-                crn = CRN(k_rates=k_rates, init_cond=init_cond, solvedT=t_eval, noise_level=noise_level)
-                df_raw = crn.data_sim.copy()  # columns: ['time','x','y']
+                    crn = CRN(k_rates=k_rates, init_cond=init_cond, solvedT=t_eval, noise_level=noise_level)
+                    df_raw = crn.data_sim.copy()
 
-                # Rename model outputs (x,y) -> standardized names (x1,x2) for consistency with the rest of the pipeline
-                rename_map = {m: model_to_std[m] for m in model_state_names}
-                df = df_raw.rename(columns=rename_map)
+                    # Rename both state columns and derivative columns
+                    rename_map = {m: model_to_std[m] for m in model_state_names}
+                    rename_map.update({'time': 'time'})
+                    # Also rename derivative columns from 'd{model_name}dt' to 'd{std_name}dt'
+                    for m in model_state_names:
+                        rename_map[f'd{m}dt'] = f'd{model_to_std[m]}dt'
 
-                # Compute derivative at each time using the model RHS, feeding values in (x,y) order
-                deriv = []
-                for i in range(len(df)):
-                    t = float(df.loc[i, 'time']) if 'time' in df.columns else float(t_eval[i])
-                    # Values in model order
-                    state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
-                    dstate = crn.toyEnzRHS(state_vec_model_order, t)
-                    deriv.append(dstate)
-                deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
+                    df = df_raw.rename(columns=rename_map)
 
-                data_augmented = pd.concat([df, deriv_df], axis=1)
-                fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
-                data_augmented.to_excel(fp, index=False)
-                filepaths.append(fp)
+                    # Only save the state trajectories (no derivatives here)
+                    fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
+                    df.to_excel(fp, index=False)
+                    filepaths.append(fp)
+            else:
+                for k in range(len(self.sample_orig)):
+                    row = self.sample_orig.iloc[k]
+                    init_cond = [float(row[s]) for s in std_in_model_order]
+
+                    crn = CRN(k_rates=k_rates, init_cond=init_cond, solvedT=t_eval, noise_level=noise_level)
+                    df_raw = crn.data_sim.copy()
+
+                    # Rename both state columns and derivative columns
+                    rename_map = {m: model_to_std[m] for m in model_state_names}
+                    rename_map.update({'time': 'time'})
+                    # Also rename derivative columns from 'd{model_name}dt' to 'd{std_name}dt'
+                    for m in model_state_names:
+                        rename_map[f'd{m}dt'] = f'd{model_to_std[m]}dt'
+
+                    rename_map = {m: model_to_std[m] for m in model_state_names}
+                    df = df_raw.rename(columns=rename_map)
+
+                    state_cols = [c for c in df.columns if c != 'time']
+                    df_states_norm = normalization(df[state_cols], self.L_orig, self.U_orig)[0]
+                    df_norm = pd.concat([df[['time']], df_states_norm], axis=1)
+
+                    # Only save the state trajectories (no derivatives here)
+                    fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
+                    df_norm.to_excel(fp, index=False)
+                    filepaths.append(fp)
+
         
         else:
             raise ValueError(f"Unsupported base model: {model_name}")
@@ -592,6 +633,7 @@ class sampling:
     def _subsample(
         self,
         filepaths,
+        L, U,
         n_bins: int = 10,
         k_max: int = 1,
     ):
@@ -600,7 +642,7 @@ class sampling:
         ----------
         filepaths : list[str]
             Paths returned by ``fit_and_save`` (each is an Excel file that holds one
-            trajectory with states *and* their derivatives).
+            trajectory with states).
         n_bins : int, default 10
             Number of equal‑width bins per dimension (stratified grid).
         k_max : int, default 1
@@ -609,8 +651,8 @@ class sampling:
         Returns
         -------
         pd.DataFrame
-            Subsampled dataframe containing *all* original columns
-            (time, states, derivatives).
+            Subsampled dataframe containing only time and state columns.
+            # NOTE: To compute time derivatives, call `compute_derivatives` on the returned DataFrame.
         """
         # Load and concatenate every trajectory dataframe
         dfs = [pd.read_excel(fp) for fp in filepaths]
@@ -620,51 +662,43 @@ class sampling:
         X = data[self.ID]
 
         # Affine‑map each state to [-1, 1]
-        L = X.min()
-        U = X.max()
+        #L = X.min()
+        #U = X.max()
         X_norm = 2 * (X - L) / (U - L) - 1
 
         if self.distribution.lower() == 'uniform':
-            """
-            # Assign every point to a grid cell
-            idx = ((X_norm + 1) * (n_bins / 2)).astype(int).clip(0, n_bins - 1)
-            idx_cols = [f"b{i}" for i in range(len(self.ID))]
-            bins = pd.DataFrame(idx.values, columns=idx_cols)
-
-            # Stratified sampling: keep ≤ k_max rows per cell
-            chosen = []
-            for _, g in data.join(bins).groupby(idx_cols, sort=False):
-                chosen.append(g.sample(min(k_max, len(g)), random_state=0))
-            result = pd.concat(chosen, ignore_index=True)
-            """
             d = len(self.ID)
-            target = min(len(data),int((n_bins ** d) * k_max))
-            idx = fps_indices(X_norm.to_numpy(),M=target,seed=0)
+            target = min(len(data), int((n_bins ** d) * k_max))
+            idx = fps_indices(X_norm.to_numpy(), M=target, seed=0)
             result = data.iloc[idx].reset_index(drop=True)
+            # Optional: relative noise (sigma = |value| * noise_level)
+            if hasattr(self, 'noise_level') and self.noise_level is not None:
+                nl = float(self.noise_level)
+                rng = np.random.default_rng(0)
+                sigma = np.abs(result[self.ID]) * nl
+                result.loc[:, self.ID] = result[self.ID] + rng.normal(0.0, sigma)
+                # result.loc[:, self.ID] = result[self.ID].clip(lower=0)
+            
         elif self.distribution.lower() == 'arcsine':
             eps = 1e-7
             # Clip the edge
-            Xn = X_norm.clip(-1+eps,1-eps).to_numpy()
+            Xn = X
+            #Xn = X_norm.clip(-1+eps, 1-eps).to_numpy()
             N, d = Xn.shape
 
             # density log t(x) = - 0.5 * sum_j log(1-x_j^2)
             log_t = -0.5 * np.log(1.0 - Xn**2).sum(axis=1)
 
-            # 
-            edges = np.linspace(-1,1,n_bins+1)
+            edges = np.linspace(-1, 1, n_bins+1)
             widths = np.diff(edges)
             log_p = np.zeros(N)
             for j in range(d):
-                # The frequency of this dimension
-                counts, _ = np.histogram(Xn[:,j],bins=edges)
-                # Frequency -> Density (avoid 0 by taking log
+                counts, _ = np.histogram(Xn[:, j], bins=edges)
                 dens = counts / (N * widths[0])
-                dens = np.maximum(dens,1e-12) # floor
-                # Find the bin for each sample
-                bj = np.clip(np.searchsorted(edges,Xn[:,j],side='right')-1,0,n_bins-1)
+                dens = np.maximum(dens, 1e-12) # floor
+                bj = np.clip(np.searchsorted(edges, Xn[:, j], side='right')-1, 0, n_bins-1)
                 log_p += np.log(dens[bj])
 
-            # weight: w ∝ target / pool
             log_w = log_t - log_p
             log_w -= log_w.max()
             w = np.exp(log_w)
@@ -674,23 +708,87 @@ class sampling:
                 w_sum = w.sum()
             p = w / w_sum
 
-            # the number of the sample
-            target = min(len(data),int((n_bins ** d) * k_max))
-
-            # Sampling without replacement by weight yields an approximate arcsine distribution
+            target = min(len(data), int((n_bins ** d) * k_max))
             rng = np.random.default_rng(0)
-            idx = rng.choice(len(data),size=target,replace=False,p=p)
+            idx = rng.choice(len(data), size=target, replace=False, p=p)
             result = data.iloc[idx].reset_index(drop=True)
-
-            """
-            n_target = int(len(data) / 2)
-            eps = 1e-12
-            w = 1.0 / np.sqrt(1 - X_norm.pow(2) + eps)
-            w = w.prod(axis=1)
-
-            result = data.sample(n=n_target,weights=w,random_state=27).reset_index(drop=True)
-            """
+            if hasattr(self, 'noise_level') and self.noise_level is not None:
+                nl = float(self.noise_level)
+                rng = np.random.default_rng(0)
+                sigma = np.abs(result[self.ID]) * nl
+                result.loc[:, self.ID] = result[self.ID] + rng.normal(0.0, sigma)
+                # result.loc[:, self.ID] = result[self.ID].clip(lower=0)
         return result
+
+    def compute_derivatives(self, subsample: pd.DataFrame, model=None, model_type=None, model_kwargs=None, sbml_path=None):
+        """
+        Compute time derivatives for a given subsample DataFrame (after selection).
+        This method augments the DataFrame with derivative columns.
+        For SBML models, provide sbml_path; for base models, provide model_name and model_kwargs.
+        Returns a new DataFrame with derivative columns appended.
+        """
+        # NOTE: This must be called after subsampling, i.e., after _subsample.
+        import copy
+        df = subsample.copy()
+        # Try to resolve state columns and time column
+        time_col = 'time' if 'time' in df.columns else None
+        state_cols = [c for c in self.ID if c in df.columns]
+        if sbml_path is not None:
+            # SBML model: use tellurium
+            rr = te.loadSBMLModel(sbml_path)
+            species_ids = [str(s) for s in rr.model.getFloatingSpeciesIds()]
+            # For each row, set the state and compute rates
+            rates_list = []
+            for t in range(len(df)):
+                state_vals = df.loc[t, species_ids].to_numpy()
+                for s, v in zip(species_ids, state_vals):
+                    rr[s] = float(v)
+                rates = rr.getRatesOfChange()
+                rates_list.append(rates)
+            derivative_df = pd.DataFrame(rates_list, columns=[f'd{s}/dt' for s in species_ids])
+            df = pd.concat([df.reset_index(drop=True), derivative_df], axis=1)
+            return df
+        elif model_type is not None:
+            # Base model: use provided model_type and kwargs
+            std_names = state_cols
+            if model_type.lower() == 'lotka-volterra':
+                model_state_names = model_kwargs.get('state_names', ["x", "y1","y2"])
+                if len(model_state_names) != 3:
+                    raise ValueError("Lotka-Volterra expects exactly 3 model state names.")
+                model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
+                params = model_kwargs.get('params')
+                lv = Lotka_Volterra(params=params, t_span=(0.0,1.0), t_eval=np.array([0.0,1.0]), z0=[0.0,0.0,0.0], noise_level=None)
+
+                deriv = []
+                for i in range(len(df)):
+                    t_val = float(df.loc[i, time_col]) if time_col else 0.0
+                    state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
+                    dstate = lv.lv_rhs_1_2(t_val, state_vec_model_order)
+                    deriv.append(dstate)
+                deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
+                df = pd.concat([df.reset_index(drop=True), deriv_df], axis=1)
+                return df
+            elif model_type.lower() == 'crn':
+                model_state_names = model_kwargs.get('state_names', ["S","E","ES","P"])
+                model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
+                k_rates = model_kwargs.get('k_rates')
+                crn = CRN(k_rates=k_rates, init_cond=[0.0]*4, solvedT=np.array([0.0,1.0]), noise_level=None)
+
+                deriv = []
+                for i in range(len(df)):
+                    t_val = float(df.loc[i, time_col]) if time_col else 0.0
+                    state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
+                    dstate = crn.toyEnzRHS(state_vec_model_order, t_val)
+                    deriv.append(dstate)
+                #deriv_df = pd.DataFrame(deriv, columns=[f"d{m}/dt" for m in model_state_names])
+                deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
+                df = pd.concat([df.reset_index(drop=True), deriv_df], axis=1)
+                return df
+            else:
+                raise ValueError(f"Unsupported base model for derivative computation: {model_type}")
+        else:
+            raise ValueError("Either sbml_path or model_type must be provided to compute derivatives.")
+        # End of compute_derivatives
     
 
 class distribution_test:
