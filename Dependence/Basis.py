@@ -13,20 +13,30 @@ from pysindy.feature_library.base import BaseFeatureLibrary, x_sequence_or_item
 
 from dae_finder import PolyFeatureMatrix
 
-def normalization(data_states):
+def normalization(data_states,L=None, U=None):
     # data_states: DataFrame, only has state columns
     data_norm = data_states.copy()
-    L,U = {},{}
-    for col in data_norm.columns:
-        Li = data_states[col].min()
-        Ui = data_states[col].max()
-        L[col] = Li
-        U[col] = Ui
-        if Li == Ui:
-            data_norm[col] = 0
-            print("Warning: All values are equal")
-        else:
-            data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
+    if L is None and U is None:
+        L,U = {},{}
+        for col in data_norm.columns:
+            Li = data_states[col].min()
+            Ui = data_states[col].max()
+            L[col] = Li
+            U[col] = Ui
+            if Li == Ui:
+                data_norm[col] = 0
+                print("Warning: All values are equal")
+            else:
+                data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
+    else:
+        for col in data_norm.columns:
+            Li = L[col]
+            Ui = U[col]
+            if Li == Ui:
+                data_norm[col] = 0
+                print("Warning: All values are equal")
+            else:
+                data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
     return data_norm, L, U
 
 
