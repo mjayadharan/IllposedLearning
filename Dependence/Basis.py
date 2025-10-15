@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from numpy.polynomial import Polynomial, chebyshev, legendre
+from numpy.polynomial import Polynomial, chebyshev, legendre, laguerre, hermite
 from typing import Iterator, Tuple
 from numpy.typing import NDArray
 from scipy import sparse
@@ -37,6 +37,32 @@ def normalization(data_states,L=None, U=None):
                 print("Warning: All values are equal")
             else:
                 data_norm[col] = 2*(data_states[col]-Li)/(Ui-Li)-1
+    return data_norm, L, U
+
+def normalization_to_01(data_states,L=None, U=None):
+    # data_states: DataFrame, only has state columns
+    data_norm = data_states.copy()
+    if L is None and U is None:
+        L,U = {},{}
+        for col in data_norm.columns:
+            Li = data_states[col].min()
+            Ui = data_states[col].max()
+            L[col] = Li
+            U[col] = Ui
+            if Li == Ui:
+                data_norm[col] = 0
+                print("Warning: All values are equal")
+            else:
+                data_norm[col] = (data_states[col]-Li)/(Ui-Li)
+    else:
+        for col in data_norm.columns:
+            Li = L[col]
+            Ui = U[col]
+            if Li == Ui:
+                data_norm[col] = 0
+                print("Warning: All values are equal")
+            else:
+                data_norm[col] = (data_states[col]-Li)/(Ui-Li)
     return data_norm, L, U
 
 
@@ -76,30 +102,34 @@ class Monomials:
         return candidate_lib
     
 class OrthogonalLibrary(BaseFeatureLibrary):
-    """Generate Chebyshev polynomial features.
-    This library generates features using Chebyshev polynomials of the first kind.
+    """Generate orthogonal polynomial features (Chebyshev, Legendre, Laguerre, Hermite).
+
+    This library generates features using a selected family of orthogonal polynomials
+    and their tensor-product interactions across input variables.
 
     Parameters
     ----------
     degree : integer, default 2
-        The maximum degree of the Chebyshev polynomial features.
+        The maximum degree of the polynomial features.
+
+    method : {'Chebyshev','Legendre','Laguerre','Hermite'}
+        Which orthogonal polynomial family to use.
 
     include_interaction : boolean, optional (default True)
         Determines whether interaction features are produced.
-        If false, features are all of the form ``T_k(x[i])`` where T_k is
-        the k-th Chebyshev polynomial.
+        If False, features are all of the form family_k(x[i]) where k is degree and i is feature index.
 
     interaction_only : boolean, optional (default False)
-        If true, only interaction features are produced: features that are
-        products of Chebyshev polynomials of distinct input features.
+        If True, only interaction features are produced: features that are products of basis
+        polynomials of distinct input features.
 
     include_bias : boolean, optional (default True)
-        If True (default), then include a bias column (T_0(x) = 1).
+        If True, then include a bias column corresponding to the order-0 basis (e.g. T_0, P_0, L_0, H_0).
 
     Attributes
     ----------
     powers_ : array, shape (n_output_features, n_input_features)
-        powers_[i, j] is the degree of the Chebyshev polynomial of the jth input 
+        powers_[i, j] is the degree of the basis polynomial of the jth input
         in the ith output feature.
 
     n_features_in_ : int
@@ -108,7 +138,6 @@ class OrthogonalLibrary(BaseFeatureLibrary):
     n_output_features_ : int
         The total number of output features.
     """
-
     def __init__(
         self,
         degree,
@@ -116,13 +145,18 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         include_interaction=True,
         interaction_only=False,
         include_bias=False,
+        original_range=None # Parameter for LegendreOriginalRange
     ):
         super().__init__()
-        self.method = method
+        if isinstance(method, str) and method.lower() == 'legendreoriginalrange':
+            self.method = 'LegendreOriginalRange'
+        else:
+            self.method = method
         self.degree = degree
         self.include_interaction = include_interaction
         self.interaction_only = interaction_only
         self.include_bias = include_bias
+        self.original_range = original_range # Store the provided range
         # Stable, shared ordering for transform() and get_feature_names()
         self._powers_sorted = None  # list[tuple[int,...]] set in fit()
         self._n_features = None     # cache input dimensionality
@@ -170,9 +204,36 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         """
         Compute the n-th Legendre polynomial P_n(x).
         """
-        T = legendre.Legendre.basis(n)
-        P = T.convert(kind=Polynomial)
+        P_1 = legendre.Legendre.basis(n)
+        P = P_1.convert(kind=Polynomial)
 
+        return P(x)
+    
+    def _legendre_polynomial_original_range(self, x: np.ndarray, n: int,
+                                            lower_bound: float, upper_bound: float) -> np.ndarray:
+        """
+        Compute the n-th Legendre polynomial P_n(x) for x in original range [lower_bound, uppper_bound]
+        """
+        # Create Legendre polynomial with specified domain and window
+        # domain: actual data range [lower_bound, upper_bound]
+        # window: standard interval [-1, 1] where Legendre polynomials are defined
+        leg = legendre.Legendre.basis(n, domain=[lower_bound, upper_bound], window=[-1, 1])
+        return leg(x)
+
+    def _laguerre_polynomial(self, x: np.ndarray, n: int) -> np.ndarray:
+        """
+        Compute the n-th (generalized) Laguerre polynomial L_n(x).
+        """
+        Ln = laguerre.Laguerre.basis(n)
+        P = Ln.convert(kind=Polynomial)
+        return P(x)
+
+    def _hermite_polynomial(self, x: np.ndarray, n: int) -> np.ndarray:
+        """
+        Compute the n-th Hermite polynomial H_n(x) (physicists' convention).
+        """
+        Hn = hermite.Hermite.basis(n)
+        P = Hn.convert(kind=Polynomial)
         return P(x)
 
     @staticmethod
@@ -284,7 +345,18 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         if input_features is None:
             input_features = [f"x{i+1}" for i in range(self.n_features_in_)]
 
-        prefix = 'T_' if str(self.method).lower().startswith('cheb') else 'P_'
+        m = str(self.method).lower()
+        if m.startswith('cheb'):
+            prefix = 'T_'
+        elif m.startswith('legen'):
+            prefix = 'P_'
+        elif m.startswith('lagu'):
+            prefix = 'L_'
+        elif m.startswith('herm'):
+            prefix = 'H_'
+        else:
+            raise ValueError(f"Unknown method '{self.method}' in OrthogonalLibrary.get_feature_names()")
+       
         names = []
         for row in powers:
             terms = []
@@ -361,6 +433,17 @@ class OrthogonalLibrary(BaseFeatureLibrary):
         check_is_fitted(self)
         if self._powers_sorted is None:
             raise RuntimeError("OrthogonalLibrary not fitted: powers order is missing.")
+        
+        # For LegendreOriginalRange, prepare the bounds
+        bounds = None
+        m = str(self.method).lower()
+        if self.method.lower().startswith('legendreoriginal'):
+            # If original_range is provided
+            if self.original_range is not None:
+                bounds = self.original_range
+            # Otherwise, need to calculate it
+            elif hasattr(self, '_original_range') and self._original_range is not None:
+                bounds = self._original_range
 
         xp_full = []
         for x in x_full:
@@ -372,6 +455,15 @@ class OrthogonalLibrary(BaseFeatureLibrary):
             n_features = x.shape[coord_axis]
             if n_features != self.n_features_in_:
                 raise ValueError("x shape does not match training shape")
+            
+            # If LegendreOriginalRange, calculate bounds if not already set
+            if str(self.method).lower().startswith('legendreoriginal') and bounds is None:
+                # Calculate bounds for each feature
+                bounds = []
+                for i in range(n_features):
+                    feat = x[..., i] if coord_axis == -1 else x[:, i]
+                    bounds.append((np.min(feat), np.max(feat)))
+                self._original_range = bounds
 
             # Create output container
             output_shape = list(x.shape)
@@ -397,10 +489,28 @@ class OrthogonalLibrary(BaseFeatureLibrary):
                     if deg <= 0:
                         continue
                     feat = take_feature(x, feat_idx)
-                    if self.method == 'Chebyshev':
-                        val = self._chebyshev_polynomial(feat, int(deg))
-                    else:  # Legendre
-                        val = self._legendre_polynomial(feat, int(deg))
+                    m = str(self.method).lower()
+
+                    # Handle LegendreOriginalRange specifically
+                    if m.startswith('legendreoriginal'):
+                        lower_bound, upper_bound = bounds[feat_idx]
+                        # If all values are equal, result will be constant
+                        if lower_bound == upper_bound:
+                            val = np.ones_like(feat)
+                        else:
+                            val = self._legendre_polynomial_original_range(feat, int(deg), lower_bound, upper_bound)
+                    # Standard Legendre and other orthogonal polynomials
+                    else:
+                        if m.startswith('cheb'):
+                            val = self._chebyshev_polynomial(feat, int(deg))
+                        elif m.startswith('legen'):
+                            val = self._legendre_polynomial(feat, int(deg))
+                        elif m.startswith('lagu'):
+                            val = self._laguerre_polynomial(feat, int(deg))
+                        elif m.startswith('herm'):
+                            val = self._hermite_polynomial(feat, int(deg))
+                        else:
+                            raise ValueError(f"Unknown method '{self.method}' in OrthogonalLibrary.transform()")
                     result = result * val
 
                 # Write column i
@@ -472,3 +582,9 @@ def IdentityChebyshevLibrary():
 
 def IdentityLegendreLibrary():
     return OrthogonalLibrary(degree=1, method='Legendre',include_bias=False)
+
+def IdentityLaguerreLibrary():
+    return OrthogonalLibrary(degree=1, method='Laguerre', include_bias=False)
+
+def IdentityHermiteLibrary():
+    return OrthogonalLibrary(degree=1, method='Hermite', include_bias=False)
