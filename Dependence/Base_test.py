@@ -106,10 +106,10 @@ class Lotka_Volterra:
                 "time": sol.t,
                 "x": sol.y[0],
                 'y1': sol.y[1],
-                'y2': sol.y[2],
-                "dxdt": dxdt_vals,
-                "dy1dt": dy1dt_vals,
-                "dy2dt": dy2dt_vals
+                'y2': sol.y[2]
+                #"dxdt": dxdt_vals,
+                #"dy1dt": dy1dt_vals,
+                #"dy2dt": dy2dt_vals
             })
         else:
             x_base = sol.y[0]
@@ -137,10 +137,10 @@ class Lotka_Volterra:
                 "time": sol.t,
                 "x": x_noisy,
                 "y1": y1_noisy,
-                "y2": y2_noisy,
-                "dxdt": dxdt_vals,
-                "dy1dt": dy1dt_vals,
-                "dy2dt": dy2dt_vals
+                "y2": y2_noisy
+                #"dxdt": dxdt_vals,
+                #"dy1dt": dy1dt_vals,
+                #"dy2dt": dy2dt_vals
             })
 
         return df
