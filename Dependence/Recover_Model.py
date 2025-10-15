@@ -8,10 +8,12 @@ from sympy import symbols, expand, sympify, Poly, collect, simplify
 from scipy.linalg import lstsq
 import sympy as sp
 
+from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
+
 from dae_finder import sequentialThLin
 from Comparison import standardize_columns, TimeSeriesDerivative
 from Basis import OrthogonalLibrary, Monomials, normalization
-from PolyConvert import OrthogonalToPolynomialConverter, EquationDenormalizer
+from PolyConvert import OrthogonalToPolynomialConverter, EquationDenormalizer, MatrixEquationDenormalizer
 import pysindy as ps
 
 import re
@@ -171,7 +173,8 @@ class WhitenedOptimizer:
     
 class Recover_Model_sindy:
     def __init__(self,data,differential_order,poly_degree,threshold,method,
-                 threshold_scan=None,Xdot=None,L=None,U=None,debug=True):
+                 threshold_scan=None,Xdot=None,debug=True,after_threshold=None,
+                 L=None, U=None,denormalize=True):
         # data: DataFrame -- contains all columns including states and time
         # for orthogonal basis, the data should have been normalized
         # method: basis library used, the default one is monomial library
@@ -183,13 +186,15 @@ class Recover_Model_sindy:
         self.threshold_scan = threshold_scan
         self.Xdot = Xdot
         self.method = method
-        self.L, self.U = L, U
         self.debug = debug
+        # Post-expansion coefficient filter (on final polynomial equations)
+        self.after_threshold = after_threshold
+        self.denormalize = denormalize # Whether to denormalize, default is True
 
-        if self.method != 'Monomial' and (self.L is None or self.U is None):
-            raise ValueError("Need to provide Lower and Upper bound for Orthogonal basis")
         self.data_states, self.time = self._preprocess()
         self.features = list(self.data_states.columns)
+
+        self.L, self.U = L.to_dict(), U.to_dict()
 
         #if self.method == 'Legendre' or 'Chebyshev':
             #self.data_norm = normalization(self.data_states)[0]
@@ -369,6 +374,108 @@ class Recover_Model_sindy:
         print("features:", self.features, "n_vars=", len(self.features))
         return data_states, time
     
+    def _build_equation_list_from_rhs(self, eq_list):
+        states, rhs_raw = [], []
+        #for var, eq in zip(model.feature_names, eq_list):
+        for var, eq in zip(self.features, eq_list):
+            states.append(f'd{var}/dt')
+            rhs_raw.append(eq.strip())
+        def clean(eq: str) -> str:
+            eq = re.sub(r'\+\s+-', '- ', eq)
+            eq = re.sub(r'\s+', ' ', eq).strip()
+            return eq
+        rhs = [clean(s) for s in rhs_raw]
+        df = pd.DataFrame({
+            'Varaiable': states,
+            'Equation': rhs
+        })
+        return df
+    
+    def _build_equation_list_for_denorm(self, eq_rhs):
+        """
+        Build ['dxi/dt = <rhs_i>'] for the denormalization pipeline.
+        - Ensures empty RHS becomes '0'
+        - Normalizes signs/spaces before denormalization (so denorm works on clean strings)
+        - Pads to self.features length if needed
+        """
+        out = []
+        n = len(eq_rhs)
+        for i, var in enumerate(self.features):
+            rhs = (eq_rhs[i] if i < n else "").strip()
+            rhs = re.sub(r'\+\s+-', '- ', rhs)
+            rhs = re.sub(r'\s+', ' ', rhs).strip()
+            if rhs == "":
+                rhs = "0"
+            out.append(f"d{var}/dt = {rhs}")
+        return out
+
+    def _convert_orthogonal_to_polynomial(self, rhs_list):
+        """
+        Convert SINDy RHS strings from an orthogonal basis to monomial polynomial strings
+        WITHOUT denormalization. Returns a list of 'dvar/dt = ...' strings in self.features order.
+        """
+        converter = OrthogonalToPolynomialConverter(max_degree=self.poly_degree, basis=self.method)
+        polynomial_model = converter.convert_sindy_model(rhs_list, self.features)
+        equation_list = []
+        for var in self.features:
+            poly = polynomial_model.get(var)
+            if poly is None:
+                equation_list.append(f"d{var}/dt = ")
+            else:
+                equation_list.append(f"d{var}/dt = {poly._to_string()}")
+        return equation_list
+
+    def _denormalize_and_format(self, equation_list):
+        """
+        Apply denormalization (based on self.method, self.L, self.U) and return a tidy DataFrame.
+        This method performs only: denormalize -> optional after-threshold -> pretty print.
+        It assumes equation_list are full strings like 'dxi/dt = ...' in monomial basis.
+        """
+        denormalizer = MatrixEquationDenormalizer(self.L, self.U, self.method)
+
+        if self.denormalize is True:
+            original_equations = denormalizer.denormalize_equations(equation_list)
+        else:
+            original_equations = equation_list
+
+        # Parse 'dx/dt = ...' into map
+        eq_map = {}
+        for eq in original_equations:
+            parts = eq.split('=', 1)
+            lhs = parts[0].strip()
+            rhs = parts[1].strip() if len(parts) > 1 else ''
+            m = re.match(r"^d(?P<var>.+)/dt$", lhs)
+            if m:
+                var_name = m.group('var').strip()
+                eq_map[var_name] = rhs
+
+        # Build rows in self.features order
+        states, rhs_raw = [], []
+        for var in self.features:
+            rhs_raw.append(eq_map.get(var, ''))
+            states.append(f'd{var}/dt')
+
+        # Clean up
+        def clean(eq: str) -> str:
+            eq = re.sub(r'\+\s+-', '- ', eq)
+            eq = re.sub(r'\s+', ' ', eq).strip()
+            return eq
+        rhs = [clean(s) for s in rhs_raw]
+
+        # Optional post-expansion hard threshold on final polynomial equations
+        if getattr(self, 'after_threshold', None) is not None and float(self.after_threshold) > 0:
+            thr = float(self.after_threshold)
+            rhs_filtered = []
+            for i, eq in enumerate(rhs):
+                new_eq, n_removed = self._filter_equation_terms(eq, self.features, thr)
+                rhs_filtered.append(new_eq)
+                if n_removed > 0:
+                    print(f"[AFTER-THRESH] filtered {n_removed} term(s) in d{self.features[i]}/dt with threshold={thr}")
+            rhs = rhs_filtered
+
+        rhs = [self._pretty_equation_rhs(s) for s in rhs]
+        return pd.DataFrame({'Variable': states, 'Equation': rhs})
+
     def _recovered_model_monomial(self):
         #differential_method = ps.FiniteDifference(self.differential_order)
         feature_library = ps.PolynomialLibrary(self.poly_degree,include_bias=False)
@@ -401,23 +508,32 @@ class Recover_Model_sindy:
         #if getattr(self, 'debug', False):
             #print("\n===== DIAG (monomial) =====")
             #self._diagnose_linear_alignment()
-        eq_list = model.equations()
+        eq_rhs = model.equations()
 
-        states, rhs_raw = [], []
-        #for var, eq in zip(model.feature_names, eq_list):
-        for var, eq in zip(self.features, eq_list):
-            states.append(f'd{var}/dt')
-            rhs_raw.append(eq.strip())
-        def clean(eq: str) -> str:
-            eq = re.sub(r'\+\s+-', '- ', eq)
-            eq = re.sub(r'\s+', ' ', eq).strip()
-            return eq
-        rhs = [clean(s) for s in rhs_raw]
-        df = pd.DataFrame({
-            'Varaiable': states,
-            'Equation': rhs
-        })
-        return df
+        # Setting for denormalized model (Compare with Legendre and Chebyshev)
+        #equation_list = self._build_equation_list_for_denorm(eq_rhs)
+        #return self._denormalize_and_format(equation_list) 
+
+        # Setting for unnormalized model (Compare with Laguerre)
+        equation_list = self._build_equation_list_from_rhs(eq_rhs)
+
+        # --- Optional: filter small coefficients on the final (monomial) equations ---
+        if getattr(self, 'after_threshold', None) is not None and float(self.after_threshold) > 0:
+            thr = float(self.after_threshold)
+            new_rhs = []
+            for i, row in equation_list.iterrows():
+                rhs_in = str(row['Equation']).strip()
+                rhs_out, n_removed = self._filter_equation_terms(rhs_in, self.features, thr)
+                if self.debug and n_removed > 0:
+                    var_name = str(row['Varaiable']) if 'Varaiable' in row else (str(row['Variable']) if 'Variable' in row else f'd{self.features[i]}/dt')
+                    print(f"[AFTER-THRESH][Monomial] filtered {n_removed} term(s) in {var_name} with threshold={thr}")
+                new_rhs.append(rhs_out)
+            equation_list['Equation'] = new_rhs
+
+        # Pretty-print RHS to 3 decimals and implicit multiplication style
+        equation_list['Equation'] = [self._pretty_equation_rhs(s) for s in equation_list['Equation']]
+
+        return equation_list
     
     def _recovered_model_orthogonal(self):
         feature_library = OrthogonalLibrary(degree=self.poly_degree, method=self.method,
@@ -451,19 +567,20 @@ class Recover_Model_sindy:
                 #print("\n===== DIAG (orthogonal) =====")
                 #self._diagnose_linear_alignment()
         eq_list = model.equations()
-        # Data-driven fix for potential library name↔column mismatch on linear tags
-        #eq_list = self._remap_legendre_linear_names_by_corr(eq_list)
         print("len(eq_list)=", len(eq_list))
-        return self._orthogonal_converter(eq_list)
+        # Step 1: orthogonal → monomial polynomial (no denormalization)
+        equation_list_poly = self._convert_orthogonal_to_polynomial(eq_list)
+        # Step 2: denormalize and format, only for Chebyshev and Legendre
+        return self._denormalize_and_format(equation_list_poly)
     
     def _recovered_model_orthogonal_OLS(self):
-        if self.method not in ('Chebyshev', 'Legendre'):
+        if self.method not in ('Chebyshev', 'Legendre','LegendreOriginalRange'):
             raise ValueError("_recovered_model_orthogonal_OLS only supports Chebyshev/Legendre.")
 
         # 1) Build orthogonal features on normalized data
         lib = OrthogonalLibrary(degree=self.poly_degree, method=self.method,include_bias=False)
         # Fit/transform API expects a list of trajectories
-        lib.fit([self.data_norm.values])
+        lib.fit([self.data_states.values])
         Phi = lib.transform([self.data_states.values])[0]  # shape (T, n_features)
         feat_names = lib.get_feature_names(input_features=self.features)
 
@@ -512,13 +629,149 @@ class Recover_Model_sindy:
         eq = re.sub(r'(?<=\d)\s+(?=[A-Za-z_])', '*', eq)
         return eq
 
-    def _orthogonal_converter(self,eq_list):
+    def _clean_equation_string(self, eq: str) -> str:
+        eq = re.sub(r'\+\s+-', '- ', eq)
+        eq = re.sub(r'\s+', ' ', eq).strip()
+        return eq
+    
+    def _pretty_equation_rhs(self, eq: str) -> str:
+        """Pretty-print RHS: replace '**' -> '^' and '*' -> space; normalize spaces/signs.
+        Examples:
+        'x1*x2' -> 'x1 x2'
+        'x1**2' -> 'x1^2'
+        '-2.124*x1*x2' -> '-2.124 x1 x2'
+        """
+        if eq is None:
+            return eq
+        s = str(eq)
+        def round_number(m):
+            val = float(m.group())
+            return f"{val:.3f}"
+        s = re.sub(r"[-+]?\d*\.\d+(?:[eE][-+]?\d+)?", round_number, s)
+        # First replace the power '**' with '^', 
+        # then change the remaining '*' to spaces (implicit multiplication)
+        s = s.replace('**', '^')
+        s = s.replace('*', ' ')
+        # Regular spaces and "+ -" combination
+        s = re.sub(r'\s+', ' ', s)
+        s = re.sub(r'\+\s+-', '- ', s)
+        return s.strip()
+
+    def _filter_equation_terms(self, eq_str: str, var_names: list, thr: float):
+        """Filter out monomial terms with |coefficient| <= thr from the RHS string.
+        Returns (new_eq_str, n_removed)."""
+        if eq_str is None:
+            return eq_str, 0
+        try:
+            syms = sp.symbols(var_names)
+            pre = self.preprocess_eq(str(eq_str))
+            expr = sp.sympify(pre, evaluate=False)
+            poly = sp.Poly(expr, *syms, domain='RR')
+            terms = poly.terms()
+            kept = []
+            for exps, coeff in terms:
+                cval = float(coeff)
+                if abs(cval) > float(thr):
+                    kept.append((exps, coeff))
+            n_removed = len(terms) - len(kept)
+            if n_removed <= 0:
+                return self._clean_equation_string(str(sp.expand(expr))), 0
+            new_expr = 0
+            for exps, coeff in kept:
+                mon = 1
+                for s, p in zip(syms, exps):
+                    if p != 0:
+                        mon *= s**p
+                new_expr += coeff * mon
+            new_expr = sp.expand(new_expr)
+            return self._clean_equation_string(str(new_expr)), n_removed
+        except Exception:
+            # If parsing fails, return original string without filtering
+            return eq_str, 0
+
+    def get_final_coefficients(self, as_dataframe: bool = True):
+        """Extract coefficients for every term in the *final* model_expression
+        (i.e., after conversion/denormalization/pretty formatting).
+
+        Returns
+        -------
+        pd.DataFrame or dict
+            If as_dataframe=True (default): a tidy DataFrame with columns
+            [state, term, coefficient]. Otherwise, returns a dict mapping
+            state -> {term -> coefficient}.
+        """
+        if not hasattr(self, 'model_expression') or self.model_expression is None:
+            raise RuntimeError("model_expression is not available yet. Fit the model first.")
+
+        df = self.model_expression
+        # be robust to both 'Variable' and historical misspelling 'Varaiable'
+        var_col = 'Variable' if 'Variable' in df.columns else ('Varaiable' if 'Varaiable' in df.columns else df.columns[0])
+        eq_col = 'Equation' if 'Equation' in df.columns else df.columns[1]
+
+        # prepare symbol table for parsing
+        var_syms = {name: sp.symbols(name) for name in self.features}
+        syms = tuple(var_syms[v] for v in self.features)
+        transf = standard_transformations + (implicit_multiplication_application,)
+
+        rows = []
+        out_map = {}
+
+        for _, row in df.iterrows():
+            lhs = str(row[var_col]).strip()
+            # try to extract the state name from 'dX/dt' pattern; otherwise keep lhs
+            m = re.match(r"^d(?P<var>.+)/dt$", lhs)
+            state = m.group('var') if m else lhs
+
+            rhs_pretty = str(row[eq_col])
+            # prepare for parsing: '^' -> '**'
+            rhs = rhs_pretty.replace('^', '**')
+            try:
+                expr = parse_expr(rhs, local_dict=var_syms, transformations=transf, evaluate=False)
+            except Exception:
+                # fallback to basic sympify
+                expr = sp.sympify(rhs, evaluate=False)
+
+            poly = sp.Poly(expr, *syms, domain='RR')
+
+            term_map = {}
+            for exps, coeff in poly.terms():
+                # build human-readable term string in our library style
+                parts = []
+                for v, p in zip(self.features, exps):
+                    if p == 0:
+                        continue
+                    if p == 1:
+                        parts.append(v) 
+                    else:
+                        parts.append(f"{v}^{p}")
+                term = ' '.join(parts) if parts else '1'
+                term_map[term] = float(coeff)
+                rows.append({'state': state, 'term': term, 'coefficient': float(coeff)})
+
+            out_map[state] = term_map
+
+        if as_dataframe:
+            # stable sort: by state, then by total degree desc, then lexicographically
+            def term_degree(t):
+                if t == '1':
+                    return 0
+                deg = 0
+                for tok in t.split():
+                    if '^' in tok:
+                        deg += int(tok.split('^')[1])
+                    else:
+                        deg += 1
+                return deg
+            rows.sort(key=lambda r: (r['state'], -term_degree(r['term']), r['term']))
+            return pd.DataFrame(rows, columns=['state', 'term', 'coefficient'])
+        else:
+            return out_map
+
+    def _orthogonal_converter(self, eq_list):
         converter = OrthogonalToPolynomialConverter(max_degree=self.poly_degree, basis=self.method)
-        polynomial_model = converter.convert_sindy_model(eq_list,self.features)
+        polynomial_model = converter.convert_sindy_model(eq_list, self.features)
 
-        denormalizer = EquationDenormalizer(self.L,self.U)
-        #equation_list = [f"d{var}/dt = {poly._to_string()}" for var, poly in polynomial_model.items()]
-
+        denormalizer = MatrixEquationDenormalizer(self.L, self.U, self.method)
         # Build equation_list in the exact self.features order
         equation_list = []
         for var in self.features:
@@ -526,8 +779,9 @@ class Recover_Model_sindy:
             if poly is None:
                 continue
             equation_list.append(f"d{var}/dt = {poly._to_string()}")
-        original_equations = equation_list
-        #original_equations = denormalizer.denormalize_equations(equation_list)
+
+        #original_equations = equation_list
+        original_equations = denormalizer.denormalize_equations(equation_list)
 
         # Parse original_equations of the form "dx/dt = ..." into {var: rhs}
         eq_map = {}
@@ -556,27 +810,25 @@ class Recover_Model_sindy:
                     rhs_raw.append('')
                 states.append(f'd{var}/dt')
 
-        # Scale each equation by (U - L)/2 for its corresponding state and expand
-        scaled_rhs_raw = []
-        for i, eq in enumerate(rhs_raw):
-            var = self.features[i]
-            scale = (self.U[var] - self.L[var]) / 2
-            try:
-                pre = self.preprocess_eq(eq)
-                expr = sp.sympify(pre, evaluate=False)
-                expr = expand(expr)
-                scaled_expr = expand(scale * expr)
-                scaled_eq = str(simplify(scaled_expr))
-            except Exception:
-                # Fallback to explicit multiplication string if sympy parsing fails
-                scaled_eq = f"{scale}*({eq})"
-            scaled_rhs_raw.append(scaled_eq)
-
         def clean(eq: str) -> str:
             eq = re.sub(r'\+\s+-', '- ', eq)
             eq = re.sub(r'\s+', ' ', eq).strip()
             return eq
         rhs = [clean(s) for s in rhs_raw]
+
+        # Optional post-expansion hard threshold on final polynomial equations
+        if getattr(self, 'after_threshold', None) is not None and float(self.after_threshold) > 0:
+            thr = float(self.after_threshold)
+            rhs_filtered = []
+            for i, eq in enumerate(rhs):
+                new_eq, n_removed = self._filter_equation_terms(eq, self.features, thr)
+                rhs_filtered.append(new_eq)
+                if n_removed > 0:
+                    print(f"[AFTER-THRESH] filtered {n_removed} term(s) in d{self.features[i]}/dt with threshold={thr}")
+            rhs = rhs_filtered
+        
+        rhs = [self._pretty_equation_rhs(s) for s in rhs]
+
         df = pd.DataFrame({
             'Variable': states,
             'Equation': rhs
