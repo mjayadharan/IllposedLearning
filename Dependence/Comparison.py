@@ -187,7 +187,18 @@ class Noise_Free_results:
                                                            input_feature_names=self.data_norm.columns)
             #candidate_lib = library.transform_to_dataframe(self.data_states, 
                                                            #input_feature_names=self.data_states.columns)
-
+        elif self.method == 'Laguerre':
+            library = OrthogonalLibrary(
+                degree=degree,
+                method='Laguerre',
+                include_bias=False,
+                include_interaction=include_interaction_flag
+            )
+            library.fit(self.data_norm)
+            #candidate_lib = library.transform_to_dataframe(self.data_norm, 
+                                                           #input_feature_names=self.data_norm.columns)
+            candidate_lib = library.transform_to_dataframe(self.data_states, 
+                                                           input_feature_names=self.data_states.columns)
         return candidate_lib
     
     def _process_single_combination(self,degree,comb):
