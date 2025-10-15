@@ -2,16 +2,17 @@ import pandas as pd
 import numpy as np
 import tellurium as te
 import os
-from scipy.stats import qmc
-from scipy.stats import chisquare
+from scipy.stats import qmc, truncnorm, chisquare
 from scipy.spatial.distance import pdist, squareform
 from scipy import stats
+from scipy.signal import savgol_filter
 from pathlib import Path
 from joblib import Parallel, delayed
 import matplotlib.pyplot as plt
+import pysindy as ps
 
 from Comparison import standardize_columns, run_noise_free_analysis
-from Basis import normalization
+from Basis import normalization, normalization_to_01
 from Base_test import Lotka_Volterra, CRN
 
 
@@ -81,6 +82,16 @@ def _process_combo(data, distribution, sbml_path, model_name, model_kwargs,
             summary_result = run_noise_free_analysis(subsample_states, degree_list, comb_list, method)
         else:
             raise ValueError("Cannot assign basis for this distribution, try another distribution")
+    elif dist_lower == 'gaussian':
+        if method == 'Hermite':
+            summary_result = run_noise_free_analysis(subsample_states, degree_list, comb_list, method)
+        else:
+            raise ValueError("Cannot assign basis for this distribution, expected method='Hermite'.")
+    elif dist_lower == 'exponential':
+        if method == 'Laguerre':
+            summary_result = run_noise_free_analysis(subsample_states, degree_list, comb_list, method)
+        else:
+            raise ValueError("Cannot assign basis for this distribution, expected method='Laguerre'.")
     else:
         raise ValueError(f"Unknown distribution: {distribution}")
 
@@ -104,19 +115,40 @@ def sobol_u01(num,d,seed=0):
 
     return (u01 + shift) % 1.0
 
-def fps_indices(X,M,seed=0):
-    # Farthest Point Sampling on rows of X (numpy array)
+def fps_indices(X, M, seed=0):
+    """
+    Farthest Point Sampling on rows of X (numpy array).
+    - Avoids selecting the same index twice.
+    - Breaks early if all remaining distances are -inf (unique points exhausted).
+    - Adds tiny jitter to break ties.
+    Returns indices into X (not deduplicated).
+    """
     rng = np.random.default_rng(seed)
+    X = np.asarray(X, dtype=float)
     N = X.shape[0]
-    M = int(min(max(1,M),N))
-    chosen = np.empty(M,dtype=int)
+    if N == 0:
+        return np.array([], dtype=int)
+    M = int(min(max(1, M), N))
+    chosen = np.empty(M, dtype=int)
+    # pick a random start
     chosen[0] = rng.integers(N)
+    # distances to the nearest chosen point
     dist = np.linalg.norm(X - X[chosen[0]], axis=1)
-
-    for i in range(1,M):
-        chosen[i] = int(np.argmax(dist))
-        dist = np.minimum(dist,np.linalg.norm(X - X[chosen[i]],axis=1)
-                          )
+    taken = np.zeros(N, dtype=bool)
+    taken[chosen[0]] = True
+    dist[taken] = -np.inf
+    for i in range(1, M):
+        # tiny jitter to break ties in a reproducible way
+        j = int(np.argmax(dist + 1e-12 * rng.random(N)))
+        if not np.isfinite(dist[j]):
+            chosen = chosen[:i]
+            break
+        chosen[i] = j
+        taken[j] = True
+        # update min-distance to the set
+        dnew = np.linalg.norm(X - X[j], axis=1)
+        dist = np.minimum(dist, dnew)
+        dist[taken] = -np.inf
     return chosen
 
 # Helper: safely widen degenerate bounds for uniform/arcsine sampling
@@ -144,18 +176,54 @@ def _widen_bounds(L, U, min_span=1e-6, frac=0.05):
             U_arr[i] = center + 0.5 * target_span
     return pd.Series(L_arr, index=L.index), pd.Series(U_arr, index=U.index)
 
+
+# Savitzky–Golay smoothing for DataFrame columns
+def _savgol_smooth_columns(df: pd.DataFrame, columns, window_length: int = 7, polyorder: int = 3, mode: str = 'interp') -> pd.DataFrame:
+    """
+    Apply Savitzky–Golay smoothing to selected columns of a DataFrame.
+    - Ensures window_length is odd, >=3, and ≤ number of rows.
+    - If window_length ≤ polyorder, it is increased minimally to satisfy requirements.
+    Returns a NEW DataFrame with the same index/columns where `columns` are smoothed.
+    """
+    if df is None or len(df) == 0:
+        return df
+    cols = list(columns)
+    n = len(df)
+    # Make window length valid: odd and not exceeding n
+    wl = int(window_length)
+    if wl % 2 == 0:
+        wl += 1
+    max_wl = n if (n % 2 == 1) else (n - 1)  # largest odd ≤ n
+    wl = max(3, min(wl, max_wl))
+    # Ensure wl & polyorder relationship
+    if wl <= int(polyorder):
+        wl = int(polyorder) + 1
+        if wl % 2 == 0:
+            wl += 1
+        wl = max(3, min(wl, max_wl))
+    # If after adjustments wl is still invalid (very short series), just return original
+    if wl < 3 or wl > n or wl <= int(polyorder):
+        return df
+    # Run S-G on the selected columns along time axis
+    arr = df[cols].to_numpy(dtype=float)
+    smoothed = savgol_filter(arr, window_length=wl, polyorder=int(polyorder), axis=0, mode=mode)
+    out = df.copy()
+    out.loc[:, cols] = smoothed
+    return out
+
 class create_initial_conditions:
     """
     This class creates a group of initial conditions.
     These conditions are uniformly/arcsine distributed in the original state space
     """
-    def __init__(self,data,num,distribution='uniform'):
+    def __init__(self, data, num, distribution='uniform', seed=None):
         # data: original dataframe including time and states columns, they are not necessary standardized or normalized.
         # num: the number of initial conditions in the group
         # distribution: expected distribution including arcsine and uniform, the defeault setting is uniform
         self.data = data
         self.num = num
         self.distribution = distribution
+        self.seed = seed
 
         data_std, self.time_col = standardize_columns(self.data)
         self.data_states = data_std.drop(columns=self.time_col)
@@ -168,25 +236,52 @@ class create_initial_conditions:
             self.sample_orig, self.sample_norm = self._uniformly_sample()
         elif self.distribution.lower() == 'arcsine':
             self.sample_orig, self.sample_norm = self._arcsine_sample()
+        elif self.distribution.lower() == 'exponential':
+            self.sample_orig, self.sample_norm = self._exponential_sample()
+        elif self.distribution.lower() == 'gaussian':
+            self.sample_orig, self.sample_norm = self._gaussian_sample()
 
     def _uniformly_sample(self):
+            self.L_orig, self.U_orig = self.data_states.min(), self.data_states.max()
+            cols = self.data_states.columns.tolist()
+            d = len(cols)
+
+            # Sobol + random shift in [0,1]^d
+            u01 = sobol_u01(self.num, d=d, seed=0)
+
+            # Safely widen degenerate columns so uniform sampling does not collapse
+            L_wide, U_wide = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
+
+            # Map to original ranges (widened if necessary)
+            Lo, Uo = self.L_orig.values, self.U_orig.values
+            #Lo, Uo = L_wide.values, U_wide.values
+            X_orig = Lo + u01 * (Uo - Lo)
+
+            # Also return a normalized representation spanning [-1, 1] regardless of data ranges
+            X_norm = 2.0 * u01 - 1.0
+            X_norm = np.clip(X_norm, -1 + 1e-7, 1 - 1e-7)
+
+            return pd.DataFrame(X_orig, columns=cols), pd.DataFrame(X_norm, columns=cols)
+    
+    def _uniform_sample(self):
+        # Per-state hard bounds from the original (standardized) state table
         self.L_orig, self.U_orig = self.data_states.min(), self.data_states.max()
         cols = self.data_states.columns.tolist()
         d = len(cols)
 
-        # Sobol + random shift in [0,1]^d
-        u01 = sobol_u01(self.num, d=d, seed=0)
+        # i.i.d. U(0,1) generator (reproducible if seed is provided)
+        rng = np.random.default_rng(self.seed)
+        u01 = rng.uniform(0.0, 1.0, size=(self.num, d))  # i.i.d. samples in [0,1]^d
 
-        # Safely widen degenerate columns so uniform sampling does not collapse
-        L_wide, U_wide = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
+        # Map to original ranges WITHOUT widening (exact hypercube defined by min/max)
+        Lo = self.L_orig.values.astype(float)  # (d,)
+        Uo = self.U_orig.values.astype(float)  # (d,)
+        X_orig = Lo + u01 * (Uo - Lo)          # (num, d); broadcasts over columns
 
-        # Map to original ranges (widened if necessary)
-        Lo, Uo = self.L_orig.values, self.U_orig.values
-        #Lo, Uo = L_wide.values, U_wide.values
-        X_orig = Lo + u01 * (Uo - Lo)
-
-        # Also return a normalized representation spanning [-1, 1] regardless of data ranges
-        X_norm = 2.0 * u01 - 1.0
+        # Provide a normalized [-1,1] representation aligned to the SAME Lo/Uo.
+        # Use a tiny floor in the denominator to handle possible degenerate spans (U==L).
+        denom = np.maximum(Uo - Lo, 1e-12)
+        X_norm = 2.0 * (X_orig - Lo) / denom - 1.0
         X_norm = np.clip(X_norm, -1 + 1e-7, 1 - 1e-7)
 
         return pd.DataFrame(X_orig, columns=cols), pd.DataFrame(X_norm, columns=cols)
@@ -204,14 +299,130 @@ class create_initial_conditions:
         x = np.clip(x, -1 + 1e-7, 1 - 1e-7)
 
         # Safely widen degenerate columns for mapping back to original scale
-        L_wide, U_wide = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
-        Lo, Uo = self.L_orig.values, self.U_orig.values
-        #Lo, Uo = L_wide.values, U_wide.values
+        Lw, Uw = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
+        Lo, Uo = Lw.values.astype(float), Uw.values.astype(float)
 
         # Map arcsine sample x ∈ [-1,1] to original ranges
         X_orig = 0.5 * (x + 1.0) * (Uo - Lo) + Lo
-
         return pd.DataFrame(X_orig, columns=cols), pd.DataFrame(x, columns=cols)
+    
+    def _exponential_sample(self):
+        # 1) Original per-state hard bounds (NO widening)
+        self.L_orig, self.U_orig = self.data_states.min(), self.data_states.max()
+        cols = self.data_states.columns.tolist()
+        d = len(cols)
+
+        Lo = self.L_orig.values.astype(float)  # lower bounds from data
+        Uo = self.U_orig.values.astype(float)  # upper bounds from data
+
+        # 2) Compute per-dimension acceptance probabilities under Exp(1) on [0,+∞)
+        #    Effective lower bound for Exp support is max(Lo, 0).
+        L_eff = np.maximum(Lo, 0.0)
+        U_eff = Uo.copy()
+
+        # Feasibility check: if U_eff <= L_eff in any dim, probability is zero -> impossible.
+        bad_dims = np.where(~np.isfinite(L_eff) | ~np.isfinite(U_eff) | (U_eff <= L_eff))[0]
+        if len(bad_dims) > 0:
+            bad_names = [cols[i] for i in bad_dims]
+            raise ValueError(
+                "Exponential sampling impossible for dimensions with U <= max(L,0): "
+                f"{bad_names}. Please ensure U_i > max(L_i, 0) for all states."
+            )
+
+        # Per-dimension acceptance prob p_j = P(L_eff <= X <= U_eff) with X~Exp(1).
+        # If U is infinite, p_j = exp(-L_eff).
+        p = np.empty(d, dtype=float)
+        for j in range(d):
+            if np.isfinite(U_eff[j]):
+                p[j] = np.exp(-L_eff[j]) - np.exp(-U_eff[j])
+            else:
+                p[j] = np.exp(-L_eff[j])
+        P_all = float(np.prod(p))
+        if not np.isfinite(P_all) or P_all <= 0.0:
+            raise ValueError("Overall acceptance probability is zero/invalid; cannot sample under the given bounds.")
+
+        # 3) Decide how many total candidates to draw (safety margin to counter variance)
+        rng = np.random.default_rng(self.seed)
+        safety = 1.25  # 25% headroom
+        n_draw = int(np.ceil(self.num / P_all * safety))
+        n_draw = max(n_draw, max(1000, 10 * d))  # ensure a reasonable batch size
+
+        accepted = []
+        total_generated = 0
+        max_rounds = 20
+
+        # 4) Rejection sampling loop with adaptive batch sizing
+        while sum(len(a) for a in accepted) < self.num and max_rounds > 0:
+            X_cand = rng.exponential(scale=1.0, size=(n_draw, d))  # Exp(1) i.i.d.
+            total_generated += n_draw
+
+            # Accept only if each coordinate lies within [Lo, Uo]
+            mask = np.ones(n_draw, dtype=bool)
+            for j in range(d):
+                # Note: if Lo[j] < 0, Exp(1) can't produce negatives, so (X>=Lo) is automatically satisfied.
+                mask &= (X_cand[:, j] >= Lo[j]) & (X_cand[:, j] <= Uo[j])
+            if np.any(mask):
+                accepted.append(X_cand[mask])
+
+            remaining = self.num - sum(len(a) for a in accepted)
+            if remaining <= 0:
+                break
+
+            # Empirical acceptance rate to refine next batch size
+            acc_count = sum(len(a) for a in accepted)
+            est_rate = max(1e-12, acc_count / float(total_generated))
+            n_draw = int(np.ceil(remaining / est_rate * safety))
+            n_draw = max(n_draw, max(1000, 10 * d))
+            max_rounds -= 1
+
+        # Final escalation if still short (rare unless P_all is tiny)
+        if sum(len(a) for a in accepted) < self.num:
+            n_draw = int(np.ceil(self.num / P_all * (safety * 4.0)))
+            X_cand = rng.exponential(scale=1.0, size=(n_draw, d))
+            mask = np.ones(n_draw, dtype=bool)
+            for j in range(d):
+                mask &= (X_cand[:, j] >= Lo[j]) & (X_cand[:, j] <= Uo[j])
+            if np.any(mask):
+                accepted.append(X_cand[mask])
+
+        X = np.vstack(accepted) if accepted else np.empty((0, d))
+        if X.shape[0] < self.num:
+            raise RuntimeError(
+                f"Failed to collect {self.num} accepted Exp(1) samples; only {X.shape[0]} obtained after "
+                f"{total_generated} draws. Check bounds: some acceptance probabilities may be extremely small."
+            )
+        X = X[:self.num]
+
+        # 5) Return also the [-1,1] normalized copy using the SAME (Lo,Uo)
+        denom = np.maximum(Uo - Lo, 1e-12)
+        X_norm = 2.0 * (X - Lo) / denom - 1.0
+        X_norm = np.clip(X_norm, -1 + 1e-7, 1 - 1e-7)
+
+        return pd.DataFrame(X, columns=cols), pd.DataFrame(X_norm, columns=cols)
+
+    def _gaussian_sample(self, sigma_z: float = np.sqrt(0.5)):
+        self.L_orig, self.U_orig = self.data_states.min(), self.data_states.max()
+        cols = self.data_states.columns.tolist()
+        d = len(cols)
+
+        # 1) Sobol + gaussian inverse CDF
+        u01 = sobol_u01(self.num, d=d, seed=0)
+        u01 = np.clip(u01, 1e-12, 1 - 1e-12)
+        z_std = stats.norm.ppf(u01)           # N(0,1)
+        z = z_std * float(sigma_z)            # N(0, sigma_z^2)，sigma_z = sqrt(1/2)
+
+        # 2) Align ±3*sigma_z to [L,U] and clip back to the interval.
+        Lw, Uw = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
+        Lo, Uo = Lw.values.astype(float), Uw.values.astype(float)
+        scale = (Uo - Lo) / (6.0 * float(sigma_z) + 1e-12)
+        center = 0.5 * (Lo + Uo)
+        X = center + z * scale
+        X = np.clip(X, Lo, Uo)
+
+        # 3) [-1,1] Linear scaling (aligned to *the same* Lo, Uo)
+        X_norm = 2.0 * (X - Lo) / np.maximum(Uo - Lo, 1e-12) - 1.0
+        X_norm = np.clip(X_norm, -1 + 1e-7, 1 - 1e-7)
+        return pd.DataFrame(X, columns=cols), pd.DataFrame(X_norm, columns=cols)
 
 
 class sampling:
@@ -227,7 +438,7 @@ class sampling:
         self.data = data
         self.num = num
         self.distribution = distribution
-        self.noise_level = noise_level
+        self.noise_level = noise_level # This noise is added to the data after sampling
 
         Creator = create_initial_conditions(self.data, self.num, self.distribution)
         #self.sample_orig = Creator.sample_orig
@@ -237,107 +448,6 @@ class sampling:
         self.data_states = Creator.data_states
         self.time_col = Creator.time_col
         self.state_cols = self.data_states.columns.tolist()
-
-    def evaluate_and_save_points_sbml(self, sbml_path: str, out_path: str, filename_prefix: str = "PTS"):
-        """Route A: evaluate RHS at joint-uniform points ([-1,1]^d) via SBML.
-        Writes a single Excel with columns [time, states, d(state)/dt].
-        """
-        out_dir, tag = self._prepare_outdir(out_path, n_step=self.num, filename_prefix=filename_prefix)
-        rr = te.loadSBMLModel(sbml_path)
-        species_ids = [str(s) for s in rr.model.getFloatingSpeciesIds()]
-        self.ID = species_ids
-
-        # Build point set in [-1,1]^d (already constructed by create_initial_conditions)
-        if len(self.sample_norm.columns) != len(species_ids):
-            raise ValueError(
-                f"Column mismatch: {len(self.sample_norm.columns)} columns vs {len(species_ids)} species (IDs: {species_ids})."
-            )
-        X = self.sample_norm.copy()
-        X.columns = species_ids
-
-        # Evaluate RHS at each point
-        rows = []
-        for k in range(len(X)):
-            vals = np.array(X.iloc[k].to_numpy(), dtype=float)
-            vals = np.where(np.isfinite(vals), vals, 0.0)
-            for s, v in zip(species_ids, vals):
-                rr[s] = float(v)
-            rates = rr.getRatesOfChange()
-            row = {s: vals[i] for i, s in enumerate(species_ids)}
-            for i, s in enumerate(species_ids):
-                row[f'd{s}/dt'] = float(rates[i])
-            row['time'] = 0.0
-            rows.append(row)
-        df = pd.DataFrame(rows, columns=['time'] + species_ids + [f'd{s}/dt' for s in species_ids])
-
-        fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_points.xlsx")
-        df.to_excel(fp, index=False)
-        return [fp]
-
-    def evaluate_and_save_points_base(self, model_name: str, out_path: str, filename_prefix: str = "PTS", **model_kwargs):
-        """Route A: evaluate RHS at joint-uniform points ([-1,1]^d) for Base_test models.
-        Writes a single Excel with columns [time, states, d(state)/dt].
-        """
-        out_dir, tag = self._prepare_outdir(out_path, n_step=self.num, filename_prefix=filename_prefix)
-        std_names = list(self.sample_norm.columns)
-        self.ID = std_names
-        X = self.sample_norm.copy()
-
-        rows = []
-        if model_name.lower() == 'lotka-volterra':
-            model_state_names = model_kwargs.get('state_names', ["x","y1","y2"])  # order matters
-            #model_state_names = model_kwargs.get('state_names', ["x","y"])  # order matters
-            if len(model_state_names) != 3:
-                raise ValueError("Lotka-Volterra expects exactly 2 model state names.")
-            if len(std_names) < 3:
-                raise ValueError("Lotka-Volterra requires at least 2 standardized state columns (e.g., x1,x2).")
-            model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
-            params = model_kwargs.get('params')
-            if params is None:
-                raise ValueError("'params' must be provided for Lotka-Volterra in model_kwargs.")
-            lv = Lotka_Volterra(params=params, t_span=(0.0,1.0), t_eval=np.array([0.0,1.0]), z0=[0.0,0.0], noise_level=None)
-            for k in range(len(X)):
-                row = {}
-                # states in model order
-                z = [float(X.loc[k, model_to_std[m]]) for m in model_state_names]
-                dstate = lv.lv_rhs_1_2(0.0, z)
-                # record states in standardized names order
-                for s in std_names:
-                    row[s] = float(X.loc[k, s])
-                for j, m in enumerate(model_state_names):
-                    row[f'd{model_to_std[m]}/dt'] = float(dstate[j])
-                row['time'] = 0.0
-                rows.append(row)
-
-        elif model_name.lower() == 'chemical reaction network' or model_name.lower() == 'crn':
-            model_state_names = model_kwargs.get('state_names', ["S","E","G","P"])  # order matters
-            if len(model_state_names) != 4:
-                raise ValueError("CRN expects exactly 4 model state names.")
-            if len(std_names) < 4:
-                raise ValueError("CRN requires at least 4 standardized state columns (e.g., x1..x4).")
-            model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
-            k_rates = model_kwargs.get('k_rates')
-            if k_rates is None:
-                raise ValueError("'k_rates' must be provided for CRN in model_kwargs.")
-            crn = CRN(k_rates=k_rates, init_cond=[0.0]*4, solvedT=np.array([0.0,1.0]), noise_level=None)
-            for k in range(len(X)):
-                row = {}
-                z = [float(X.loc[k, model_to_std[m]]) for m in model_state_names]
-                dstate = crn.toyEnzRHS(z, 0.0)
-                for s in std_names:
-                    row[s] = float(X.loc[k, s])
-                for j, m in enumerate(model_state_names):
-                    row[f'd{model_to_std[m]}/dt'] = float(dstate[j])
-                row['time'] = 0.0
-                rows.append(row)
-        else:
-            raise ValueError(f"Unsupported base model for pointwise evaluation: {model_name}")
-
-        cols = ['time'] + std_names + [f'd{s}/dt' for s in std_names]
-        df = pd.DataFrame(rows, columns=cols)
-        fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_points.xlsx")
-        df.to_excel(fp, index=False)
-        return [fp]
 
     def _prepare_outdir(self, out_path, n_step, filename_prefix):
         """Ensure output directory contains a run tag with num & n_step.
@@ -521,50 +631,83 @@ class sampling:
                 raise ValueError("'params' must be provided for Lotka-Volterra in model_kwargs.")
             noise_level = model_kwargs.get('noise_level', None)
 
-            if method == 'Monomial': 
-                for k in range(len(self.sample_orig)):
-                    row = self.sample_orig.iloc[k]
-                    # Initial condition in the model's variable order (x,y)
-                    z0= [float(row[s]) for s in std_in_model_order]
+            # Compute derivatives with central finite difference and use function in pysindy
+            cfd = ps.FiniteDifference(order=2)
 
-                    # Simulate via the Base_test class
-                    lv = Lotka_Volterra(params=params, t_span=t_span, t_eval=t_eval, z0=z0, noise_level=noise_level)
-                    df_raw = lv.data_sim.copy()  # columns: ['time','x','y1','y2']
+            for k in range(len(self.sample_orig)):
+                row = self.sample_orig.iloc[k]
+                # Initial condition in the model's variable order (x,y)
+                z0= [float(row[s]) for s in std_in_model_order]
 
-                    # Rename model outputs to standardized names for consistency
-                    rename_map = {m: model_to_std[m] for m in model_state_names}
-                    rename_map.update({'time': 'time'})
-                    df = df_raw.rename(columns=rename_map)
+                # Simulate via the Base_test class
+                lv = Lotka_Volterra(params=params, t_span=t_span, t_eval=t_eval, z0=z0, noise_level=noise_level)
+                df_raw = lv.data_sim.copy()  # columns: ['time','x','y1','y2']
 
-                    # Only save the state trajectories (no derivatives here)
+                # Rename model outputs to standardized names for consistency
+                rename_map = {m: model_to_std[m] for m in model_state_names}
+                rename_map.update({'time': 'time'})
+                df = df_raw.rename(columns=rename_map)
+
+                state_cols = [c for c in df.columns if c != 'time']
+                t = df['time'].to_numpy()
+                #L_sample, U_sample = df[state_cols].min(), df[state_cols].max()
+                L_sample, U_sample = self.L_orig, self.U_orig
+                L_sample, U_sample = _widen_bounds(L_sample, U_sample, min_span=1e-8, frac=0.01)
+
+                # Add relative noise to state columns
+                if hasattr(self, 'noise_level') and self.noise_level is not None:
+                    nl = float(self.noise_level)
+                    rng = np.random.default_rng(0)
+                    sigma = np.abs(df[state_cols]) * nl
+                    df.loc[:, state_cols] = df[state_cols] + rng.normal(0.0, sigma)
+                    # Optional: smooth noisy states with Savitzky–Golay filter
+                    if hasattr(self, 'noise_level') and self.noise_level is not None:
+                        df = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
+
+                if method in ('Monomial','Laguerre'):
+                    X = df[state_cols].to_numpy()
+                    Xdot = cfd(X,t)
+
+                    for j,s in enumerate(state_cols):
+                        col = f'd{s}/dt'
+                        df[col] = Xdot[:,j]                   
+
+                    # Only save the state trajectories 
                     fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                     df.to_excel(fp, index=False)
-                    filepaths.append(fp)
-            else:
-                for k in range(len(self.sample_orig)):
-                    row = self.sample_orig.iloc[k]
-                    # Initial condition in the model's variable order (x,y)
-                    z0= [float(row[s]) for s in std_in_model_order]
-
-                    # Simulate via the Base_test class
-                    lv = Lotka_Volterra(params=params, t_span=t_span, t_eval=t_eval, z0=z0, noise_level=noise_level)
-                    df_raw = lv.data_sim.copy()  # columns: ['time','x','y1','y2']
-
-                    # Rename model outputs to standardized names for consistency
-                    rename_map = {m: model_to_std[m] for m in model_state_names}
-                    rename_map.update({'time': 'time'})
-                    df = df_raw.rename(columns=rename_map)
-
-                    state_cols = [c for c in df.columns if c != 'time']
-                    df_states_norm = normalization(df[state_cols], self.L_orig, self.U_orig)[0]
+                elif method in ('Legendre','Chebyshev', 'Hermite'):
+                    df_states_norm = normalization(df[state_cols], L_sample, U_sample)[0]
                     df_norm = pd.concat([df[['time']], df_states_norm], axis=1)
+                    X = df_norm[state_cols].to_numpy()
+                    Xdot = cfd(X,t)
+                    # Scale derivatives column‑wise by 2/(U-L) per state (chain‑rule on normalized states)
+                    denom = np.maximum((U_sample.values.astype(float) - L_sample.values.astype(float)), 1e-12)
+                    scale_vec = (2.0 / denom).reshape(1, -1)
+                    Xdot = Xdot * scale_vec
 
-                    # Only save the state trajectories (no derivatives here)
+                    for j,s in enumerate(state_cols):
+                        col = f'd{s}/dt'
+                        df_norm[col] = Xdot[:,j]
+
+                    # Only save the state trajectories 
                     fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                     df_norm.to_excel(fp, index=False)
-                    filepaths.append(fp)
+                #elif method == 'Laguerre':
+                    #df_states_norm = normalization_to_01(df[state_cols], L_sample, U_sample)[0]
+                    #df_norm = pd.concat([df[['time']], df_states_norm], axis=1)
+                    #Xdot = cfd(X,t)
 
+                    #for j,s in enumerate(state_cols):
+                        #col = f'd{s}/dt'
+                        #df_norm[col] = Xdot[:,j]
 
+                    # Only save the state trajectories 
+                    #fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
+                    #df_norm.to_excel(fp, index=False)
+                else:
+                    raise ValueError(f"Unsupported basis library: {method}")
+                filepaths.append(fp)
+            
         elif model_name.lower() == 'crn':
             model_state_names = model_kwargs.get('state_names', ["S","E","ES","P"])
             model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
@@ -574,66 +717,89 @@ class sampling:
             method = model_kwargs.get('method')
             if k_rates is None:
                 raise ValueError("'k_rates' must be provided for Chemical Reaction Network in model_kwargs.")
-            noise_level = model_kwargs.get('noise_level', None)
+            noise_level = model_kwargs.get('noise_level', None) # This noise is added to generate a noisy or not original dataset
+            # Compute derivatives with central finite difference and use function in pysindy
+            cfd = ps.FiniteDifference(order=2)
 
-            if method == 'Monomial':
-                for k in range(len(self.sample_orig)):
-                    row = self.sample_orig.iloc[k]
-                    init_cond = [float(row[s]) for s in std_in_model_order]
+            for k in range(len(self.sample_orig)):
+                row = self.sample_orig.iloc[k]
+                init_cond = [float(row[s]) for s in std_in_model_order]
 
-                    crn = CRN(k_rates=k_rates, init_cond=init_cond, solvedT=t_eval, noise_level=noise_level)
-                    df_raw = crn.data_sim.copy()
+                # Simulate via the Base_test class
+                crn = CRN(k_rates=k_rates, init_cond=init_cond, solvedT=t_eval, noise_level=noise_level)
+                df_raw = crn.data_sim.copy()
 
-                    # Rename both state columns and derivative columns
-                    rename_map = {m: model_to_std[m] for m in model_state_names}
-                    rename_map.update({'time': 'time'})
-                    # Also rename derivative columns from 'd{model_name}dt' to 'd{std_name}dt'
-                    for m in model_state_names:
-                        rename_map[f'd{m}dt'] = f'd{model_to_std[m]}dt'
+                # Rename model outputs to standardized names for consistency
+                rename_map = {m: model_to_std[m] for m in model_state_names}
+                rename_map.update({'time': 'time'})
+                df = df_raw.rename(columns=rename_map)
 
-                    df = df_raw.rename(columns=rename_map)
+                state_cols = [c for c in df.columns if c != 'time']
 
-                    # Only save the state trajectories (no derivatives here)
+                # Use global normalization bounds for all trajectories (avoid mapping endpoints to exactly ±1)
+                #L_sample, U_sample = df[state_cols].min(), df[state_cols].max()
+                L_sample, U_sample = self.L_orig, self.U_orig
+                #L_sample, U_sample = _widen_bounds(L_sample, U_sample, min_span=1e-8, frac=0.01)
+
+                #df_states = df[state_cols]
+                #mask_in = np.all((df_states.values >= -1.0) & (df_states.values <= 1.0), axis=1)
+                #df = df.loc[mask_in].reset_index(drop=True)
+                t = df['time'].to_numpy() 
+
+                # Add relative noise to state columns
+                if hasattr(self, 'noise_level') and self.noise_level is not None:
+                    nl = float(self.noise_level)
+                    rng = np.random.default_rng(0)
+                    sigma = np.abs(df[state_cols]) * nl
+                    df.loc[:, state_cols] = df[state_cols] + rng.normal(0.0, sigma)
+                    # Optional: smooth noisy states with Savitzky–Golay filter
+                    df = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
+
+                if hasattr(self, 'noise_level') and self.noise_level is not None:
+                        df_deriv = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
+                else:
+                        df_deriv = df.copy()
+
+                if method in ('Laguerre'):
+                    X = df_deriv[state_cols].to_numpy()
+                    Xdot = cfd(X,t)
+
+                    for j,s in enumerate(state_cols):
+                        col = f'd{s}/dt'
+                        df[col] = Xdot[:,j]                   
+
+                    # Only save the state trajectories 
                     fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                     df.to_excel(fp, index=False)
-                    filepaths.append(fp)
-            else:
-                for k in range(len(self.sample_orig)):
-                    row = self.sample_orig.iloc[k]
-                    init_cond = [float(row[s]) for s in std_in_model_order]
-
-                    crn = CRN(k_rates=k_rates, init_cond=init_cond, solvedT=t_eval, noise_level=noise_level)
-                    df_raw = crn.data_sim.copy()
-
-                    # Rename both state columns and derivative columns
-                    rename_map = {m: model_to_std[m] for m in model_state_names}
-                    rename_map.update({'time': 'time'})
-                    # Also rename derivative columns from 'd{model_name}dt' to 'd{std_name}dt'
-                    for m in model_state_names:
-                        rename_map[f'd{m}dt'] = f'd{model_to_std[m]}dt'
-
-                    rename_map = {m: model_to_std[m] for m in model_state_names}
-                    df = df_raw.rename(columns=rename_map)
-
-                    state_cols = [c for c in df.columns if c != 'time']
-                    df_states_norm = normalization(df[state_cols], self.L_orig, self.U_orig)[0]
+                #else:
+                elif method in ('Legendre','Chebyshev','Hermite','Monomial'):
+                    X = df[state_cols].to_numpy()
+                    df_states_norm = normalization(df[state_cols], L_sample, U_sample)[0]
+                    X_norm = df_states_norm.to_numpy()
                     df_norm = pd.concat([df[['time']], df_states_norm], axis=1)
+                    Xdot = cfd(X_norm,t)
+                    # Scale derivatives column‑wise by 2/(U-L) per state (chain‑rule on normalized states)
+                    #denom = np.maximum((U_sample.values.astype(float) - L_sample.values.astype(float)), 1e-12)
+                    #scale_vec = (2.0 / denom).reshape(1, -1)
+                    #Xdot = Xdot * scale_vec
 
-                    # Only save the state trajectories (no derivatives here)
+                    for j,s in enumerate(state_cols):
+                        col = f'd{s}/dt'
+                        df_norm[col] = Xdot[:,j]
+
+                    # Only save the state trajectories 
                     fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                     df_norm.to_excel(fp, index=False)
-                    filepaths.append(fp)
-
-        
-        else:
-            raise ValueError(f"Unsupported base model: {model_name}")
-
+                #else:
+                    #raise ValueError(f"Unsupported basis library: {method}")
+                filepaths.append(fp)
+ 
         return filepaths
-    
+
     def _subsample(
         self,
         filepaths,
-        L, U,
+        L=None, U=None,
         n_bins: int = 10,
         k_max: int = 1,
     ):
@@ -659,26 +825,34 @@ class sampling:
         print("Subsample input columns:", dfs[0].columns.tolist())
         data = pd.concat(dfs, ignore_index=True)
 
-        X = data[self.ID]
+        # Drop global start/end time rows to reduce mass at normalization endpoints (±1)
+        if 'time' in data.columns:
+            tmin = data['time'].min()
+            tmax = data['time'].max()
+            mask_mid = (data['time'] != tmin) & (data['time'] != tmax)
+            if mask_mid.any():
+                data = data.loc[mask_mid].reset_index(drop=True)
 
-        # Affine‑map each state to [-1, 1]
-        #L = X.min()
-        #U = X.max()
+        X = data[self.ID]
+        # Default bounds if not provided
+        if L is None or U is None:
+            L = X.min()
+            U = X.max()
+        L, U = _widen_bounds(L, U, min_span=1e-8, frac=0.01)
         X_norm = 2 * (X - L) / (U - L) - 1
 
         if self.distribution.lower() == 'uniform':
             d = len(self.ID)
-            target = min(len(data), int((n_bins ** d) * k_max))
-            idx = fps_indices(X_norm.to_numpy(), M=target, seed=0)
+            Xn = X.to_numpy()
+            # Deduplicate (within rounding tolerance) to avoid repeated identical rows in the output
+            Xn_round = np.round(Xn, 8)
+            uniq, uniq_idx = np.unique(Xn_round, axis=0, return_index=True)
+            n_unique = len(uniq_idx)
+            target = min(n_unique, int((n_bins ** d) * k_max), len(data))
+            # Run FPS on the unique representatives, then map back
+            idx_u = fps_indices(uniq, M=target, seed=0)
+            idx = np.asarray(uniq_idx)[idx_u]
             result = data.iloc[idx].reset_index(drop=True)
-            # Optional: relative noise (sigma = |value| * noise_level)
-            if hasattr(self, 'noise_level') and self.noise_level is not None:
-                nl = float(self.noise_level)
-                rng = np.random.default_rng(0)
-                sigma = np.abs(result[self.ID]) * nl
-                result.loc[:, self.ID] = result[self.ID] + rng.normal(0.0, sigma)
-                # result.loc[:, self.ID] = result[self.ID].clip(lower=0)
-
         elif self.distribution.lower() == 'arcsine':
             eps = 1e-7
             # Clip the edge
@@ -713,12 +887,87 @@ class sampling:
             rng = np.random.default_rng(0)
             idx = rng.choice(len(data), size=target, replace=False, p=p)
             result = data.iloc[idx].reset_index(drop=True)
-            if hasattr(self, 'noise_level') and self.noise_level is not None:
-                nl = float(self.noise_level)
-                rng = np.random.default_rng(0)
-                sigma = np.abs(result[self.ID]) * nl
-                result.loc[:, self.ID] = result[self.ID] + rng.normal(0.0, sigma)
-                # result.loc[:, self.ID] = result[self.ID].clip(lower=0)
+        elif self.distribution.lower() in ('gaussian'):
+            Ls, Us = pd.Series(L), pd.Series(U)
+            Lw, Uw = _widen_bounds(Ls, Us, min_span=1e-6, frac=0.05)
+            L_arr, U_arr = Lw.values.astype(float), Uw.values.astype(float)
+            sigma = np.sqrt(0.5)
+            scale = (U_arr - L_arr) / (6.0 * sigma + 1e-12)
+            center = 0.5 * (L_arr + U_arr)
+            Z = (X.to_numpy() - center) / scale
+            # Target log-density under product exp(-z^2)
+            log_t = -np.sum(Z**2, axis=1)
+            # Empirical marginal densities via histograms on Z within ±3.5σ
+            z_max = 3.5
+            edges_list = [np.linspace(-z_max, z_max, int(n_bins)+1) for _ in range(Z.shape[1])]
+            counts, _ = np.histogramdd(Z, bins=edges_list)
+            widths = [np.diff(e)[0] for e in edges_list]
+            dens_per_dim = []
+            D = counts.ndim  # equals Z.shape[1]
+            for j in range(Z.shape[1]):
+                axes_to_sum = tuple(ax for ax in range(D) if ax != j)
+                counts_j = counts.sum(axis=axes_to_sum) if len(axes_to_sum) > 0 else counts
+                # ensure 1-D marginal of length n_bins
+                counts_j = np.asarray(counts_j, dtype=float).reshape(-1)
+                dens_j = counts_j / (len(Z) * widths[j])
+                dens_j = np.maximum(dens_j, 1e-12)
+                bj = np.clip(np.searchsorted(edges_list[j], Z[:, j], side='right') - 1, 0, int(n_bins) - 1)
+                dens_per_dim.append(dens_j[bj])
+            log_p = np.log(np.column_stack(dens_per_dim)).sum(axis=1)
+            log_w = log_t - log_p
+            log_w -= np.max(log_w)
+            w = np.exp(log_w)
+            w_sum = w.sum()
+            if not np.isfinite(w_sum) or w_sum <= 0:
+                w = np.ones_like(w) / len(w)
+            else:
+                w = w / w_sum
+            d = len(self.ID)
+            target = min(len(data), int((n_bins ** d) * k_max))
+            rng = np.random.default_rng(0)
+            idx = rng.choice(len(data), size=target, replace=False, p=w)
+            result = data.iloc[idx].reset_index(drop=True)
+        elif self.distribution.lower() in ('exponential'):
+            # Importance resampling towards product Exp(1) shape per dimension.
+            # Map X to canonical z via scale s such that 99% quantile aligns with U (same as IC sampling).
+            Ls, Us = pd.Series(L), pd.Series(U)
+            Lw, Uw = _widen_bounds(Ls, Us, min_span=1e-6, frac=0.05)
+            Lo, Uo = Lw.values.astype(float), Uw.values.astype(float)
+            L_trunc = np.maximum(Lo, 0.0)
+            q = -np.log(1.0 - 0.99)  # ln(100)
+            s = (Uo - L_trunc) / (q + 1e-12)
+            s = np.where(s > 0, s, 1.0)
+            Z = (np.clip(X.to_numpy(), L_trunc, Uo) - L_trunc) / np.maximum(s, 1e-12)
+            # Target log-density for product of Exp(1): -sum(Z)
+            log_t = -np.sum(Z, axis=1)
+            # Empirical marginal densities via histograms on Z over [0, q]
+            edges_list = [np.linspace(0.0, float(q), int(n_bins)+1) for _ in range(Z.shape[1])]
+            counts, _ = np.histogramdd(Z, bins=edges_list)
+            widths = [np.diff(e)[0] for e in edges_list]
+            dens_per_dim = []
+            D = counts.ndim
+            for j in range(Z.shape[1]):
+                axes_to_sum = tuple(ax for ax in range(D) if ax != j)
+                counts_j = counts.sum(axis=axes_to_sum) if len(axes_to_sum) > 0 else counts
+                counts_j = np.asarray(counts_j, dtype=float).reshape(-1)
+                dens_j = counts_j / (len(Z) * widths[j])
+                dens_j = np.maximum(dens_j, 1e-12)
+                bj = np.clip(np.searchsorted(edges_list[j], Z[:, j], side='right') - 1, 0, int(n_bins) - 1)
+                dens_per_dim.append(dens_j[bj])
+            log_p = np.log(np.column_stack(dens_per_dim)).sum(axis=1)
+            log_w = log_t - log_p
+            log_w -= np.max(log_w)
+            w = np.exp(log_w)
+            w_sum = w.sum()
+            if not np.isfinite(w_sum) or w_sum <= 0:
+                w = np.ones_like(w) / len(w)
+            else:
+                w = w / w_sum
+            d = len(self.ID)
+            target = min(len(data), int((n_bins ** d) * k_max))
+            rng = np.random.default_rng(0)
+            idx = rng.choice(len(data), size=target, replace=False, p=w)
+            result = data.iloc[idx].reset_index(drop=True)
         return result
 
     def compute_derivatives(self, subsample: pd.DataFrame, model=None, model_type=None, model_kwargs=None, sbml_path=None):
@@ -1574,6 +1823,88 @@ class Trend_IC_time:
             figs[(comb_tag,'fix-num')] = _plot_case_fix_num(table, comb_tag)
             figs[(comb_tag,'fix-nstep')] = _plot_case_fix_nstep(table, comb_tag)
         return figs
+
+    def _analysis_summary_fd_parallel(self, n_jobs: int = -1, backend: str = 'loky'):
+        """
+        Run the finite-difference variant of the pipeline in parallel:
+          1) simulate trajectories from uniform initial conditions (same as original)
+          2) for method=='Monomial' keep original scale; for method=='Legendre' normalize to [-1,1]
+          3) compute per-trajectory derivatives via PySINDy 2nd-order centered difference
+          4) concatenate all rows, then FPS-subspace subsample **states**; select corresponding derivative rows
+        Stores results in self.results_fd and wide tables in self.ill2_table_fd / self.ill3_table_fd.
+        """
+        if self.out_root is not None:
+            base_dir = Path(self.out_root)
+        elif self.sbml_path is not None:
+            base_dir = Path(self.sbml_path).parent
+        else:
+            base_dir = Path.cwd()
+
+        # Directory prefix by distribution
+        if self.distribution == 'uniform':
+            base_dir = base_dir / "IC_uniform"
+        elif self.distribution == 'arcsine':
+            base_dir = base_dir / "IC_arcsine"
+
+        def _get_start_end(idx):
+            if len(self.start_list) == len(self.n_steps_list):
+                start = self.start_list[idx]
+            elif len(self.start_list) == 1:
+                start = self.start_list[0]
+            else:
+                raise ValueError("start_list length must be 1 or match n_steps_list length")
+            if len(self.end_list) == len(self.n_steps_list):
+                end = self.end_list[idx]
+            elif len(self.end_list) == 1:
+                end = self.end_list[0]
+            else:
+                raise ValueError("end_list length must be 1 or match n_steps_list length")
+            return start, end
+
+        tasks = []
+        for num in self.num_list:
+            for idx, n_step in enumerate(self.n_steps_list):
+                start, end = _get_start_end(idx)
+                out_path = base_dir / f"IC_{self.distribution}_n{int(num)}_pts{int(n_step)}"
+                tasks.append((num, n_step, start, end, str(out_path), self.pointwise))
+
+        results_fd = Parallel(n_jobs=n_jobs, backend=backend, prefer='processes')([
+            delayed(_process_combo_fd)(
+                self.data,
+                self.distribution,
+                self.sbml_path,
+                self.model_name,
+                self.model_kwargs,
+                num,
+                n_step,
+                start,
+                end,
+                self.degree_list,
+                self.comb_list,
+                self.method,
+                out_dir_str,
+                pointwise,
+            ) for (num, n_step, start, end, out_dir_str, pointwise) in tasks
+        ])
+
+        self.results_fd = results_fd
+        # Reuse the existing table builder on the new summaries
+        # Temporarily swap self.results to reuse _modify_pattern
+        old_results = getattr(self, "results", None)
+        self.results = self.results_fd
+        self.ill2_table_fd, self.ill3_table_fd = self._modify_pattern(degree_start=1, fill=None, keep_max_col=True)
+        # restore
+        self.results = old_results
+        return self.results_fd
+
+    def run_fd_pipeline(self, n_jobs: int = -1, backend: str = 'loky'):
+        """
+        Public entrypoint to run the new finite-difference pipeline without altering
+        the original behavior. Usage:
+            trend = Trend_IC_time(..., method='Legendre', distribution='uniform', ...)
+            fd_results = trend.run_fd_pipeline()
+        """
+        return self._analysis_summary_fd_parallel(n_jobs=n_jobs, backend=backend)
 
     def _analysis_summary_parallel(self, n_jobs=-1, backend='loky'):
         if self.out_root is not None:
