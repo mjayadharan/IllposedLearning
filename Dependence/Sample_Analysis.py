@@ -241,16 +241,14 @@ class create_initial_conditions:
         elif self.distribution.lower() == 'gaussian':
             self.sample_orig, self.sample_norm = self._gaussian_sample()
 
-    def _uniformly_sample(self):
+    # uniformly_sample is the way used afterwards
+    def _uniformly_sample(self):   
             self.L_orig, self.U_orig = self.data_states.min(), self.data_states.max()
             cols = self.data_states.columns.tolist()
             d = len(cols)
 
             # Sobol + random shift in [0,1]^d
             u01 = sobol_u01(self.num, d=d, seed=0)
-
-            # Safely widen degenerate columns so uniform sampling does not collapse
-            L_wide, U_wide = _widen_bounds(self.L_orig, self.U_orig, min_span=1e-6, frac=0.05)
 
             # Map to original ranges (widened if necessary)
             Lo, Uo = self.L_orig.values, self.U_orig.values
@@ -614,13 +612,8 @@ class sampling:
 
         if model_name.lower() == 'lotka-volterra':
             # Map standardized names (x1,x2,...) to the Base_test internal names (x,y)
-            #model_state_names = model_kwargs.get('state_names', ["x","y"])  # order matters
+            # model_state_names = model_kwargs.get('state_names', ["x","y"])  # order matters
             model_state_names = model_kwargs.get('state_names', ["x", "y1","y2"])  # order matters
-            if len(model_state_names) != 3:
-                raise ValueError("Lotka-Volterra expects exactly 3 model state names.")
-            if len(std_names) < 3:
-                raise ValueError("Lotka-Volterra requires at least three standardized state columns (e.g., x1,x2,x3).")
-
             # Build a consistent mapping between model names and standardized names, in order
             model_to_std = {m: std_names[i] for i, m in enumerate(model_state_names)}
             std_in_model_order = [model_to_std[m] for m in model_state_names]  # e.g. ['x1','x2','x3']
@@ -650,9 +643,7 @@ class sampling:
 
                 state_cols = [c for c in df.columns if c != 'time']
                 t = df['time'].to_numpy()
-                #L_sample, U_sample = df[state_cols].min(), df[state_cols].max()
                 L_sample, U_sample = self.L_orig, self.U_orig
-                L_sample, U_sample = _widen_bounds(L_sample, U_sample, min_span=1e-8, frac=0.01)
 
                 # Add relative noise to state columns
                 if hasattr(self, 'noise_level') and self.noise_level is not None:
@@ -661,10 +652,11 @@ class sampling:
                     sigma = np.abs(df[state_cols]) * nl
                     df.loc[:, state_cols] = df[state_cols] + rng.normal(0.0, sigma)
                     # Optional: smooth noisy states with Savitzky–Golay filter
-                    if hasattr(self, 'noise_level') and self.noise_level is not None:
-                        df = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
+                    df = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
+                else:
+                    df_derive = df.copy()
 
-                if method in ('Monomial','Laguerre'):
+                if method in ('Laguerre','Monomial'):
                     X = df[state_cols].to_numpy()
                     Xdot = cfd(X,t)
 
@@ -675,15 +667,12 @@ class sampling:
                     # Only save the state trajectories 
                     fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                     df.to_excel(fp, index=False)
-                elif method in ('Legendre','Chebyshev', 'Hermite'):
+                elif method in ('Legendre','Chebyshev','Hermite'):
+                    X = df[state_cols].to_numpy()
                     df_states_norm = normalization(df[state_cols], L_sample, U_sample)[0]
+                    X_norm = df_states_norm.to_numpy()
                     df_norm = pd.concat([df[['time']], df_states_norm], axis=1)
-                    X = df_norm[state_cols].to_numpy()
-                    Xdot = cfd(X,t)
-                    # Scale derivatives column‑wise by 2/(U-L) per state (chain‑rule on normalized states)
-                    denom = np.maximum((U_sample.values.astype(float) - L_sample.values.astype(float)), 1e-12)
-                    scale_vec = (2.0 / denom).reshape(1, -1)
-                    Xdot = Xdot * scale_vec
+                    Xdot = cfd(X_norm,t)
 
                     for j,s in enumerate(state_cols):
                         col = f'd{s}/dt'
@@ -692,18 +681,6 @@ class sampling:
                     # Only save the state trajectories 
                     fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                     df_norm.to_excel(fp, index=False)
-                #elif method == 'Laguerre':
-                    #df_states_norm = normalization_to_01(df[state_cols], L_sample, U_sample)[0]
-                    #df_norm = pd.concat([df[['time']], df_states_norm], axis=1)
-                    #Xdot = cfd(X,t)
-
-                    #for j,s in enumerate(state_cols):
-                        #col = f'd{s}/dt'
-                        #df_norm[col] = Xdot[:,j]
-
-                    # Only save the state trajectories 
-                    #fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
-                    #df_norm.to_excel(fp, index=False)
                 else:
                     raise ValueError(f"Unsupported basis library: {method}")
                 filepaths.append(fp)
@@ -737,13 +714,8 @@ class sampling:
                 state_cols = [c for c in df.columns if c != 'time']
 
                 # Use global normalization bounds for all trajectories (avoid mapping endpoints to exactly ±1)
-                #L_sample, U_sample = df[state_cols].min(), df[state_cols].max()
                 L_sample, U_sample = self.L_orig, self.U_orig
-                #L_sample, U_sample = _widen_bounds(L_sample, U_sample, min_span=1e-8, frac=0.01)
-
-                #df_states = df[state_cols]
-                #mask_in = np.all((df_states.values >= -1.0) & (df_states.values <= 1.0), axis=1)
-                #df = df.loc[mask_in].reset_index(drop=True)
+                
                 t = df['time'].to_numpy() 
 
                 # Add relative noise to state columns
@@ -754,13 +726,10 @@ class sampling:
                     df.loc[:, state_cols] = df[state_cols] + rng.normal(0.0, sigma)
                     # Optional: smooth noisy states with Savitzky–Golay filter
                     df = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
-
-                if hasattr(self, 'noise_level') and self.noise_level is not None:
-                        df_deriv = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
                 else:
-                        df_deriv = df.copy()
+                    df_deriv = df.copy()
 
-                if method in ('Laguerre'):
+                if method in ('Laguerre','Monomial'):
                     X = df_deriv[state_cols].to_numpy()
                     Xdot = cfd(X,t)
 
@@ -772,16 +741,12 @@ class sampling:
                     fp = os.path.join(out_dir, f"{filename_prefix}_{tag}_{k:03d}.xlsx")
                     df.to_excel(fp, index=False)
                 #else:
-                elif method in ('Legendre','Chebyshev','Hermite','Monomial'):
+                elif method in ('Legendre','Chebyshev','Hermite'):
                     X = df[state_cols].to_numpy()
                     df_states_norm = normalization(df[state_cols], L_sample, U_sample)[0]
                     X_norm = df_states_norm.to_numpy()
                     df_norm = pd.concat([df[['time']], df_states_norm], axis=1)
                     Xdot = cfd(X_norm,t)
-                    # Scale derivatives column‑wise by 2/(U-L) per state (chain‑rule on normalized states)
-                    #denom = np.maximum((U_sample.values.astype(float) - L_sample.values.astype(float)), 1e-12)
-                    #scale_vec = (2.0 / denom).reshape(1, -1)
-                    #Xdot = Xdot * scale_vec
 
                     for j,s in enumerate(state_cols):
                         col = f'd{s}/dt'
@@ -857,7 +822,6 @@ class sampling:
             eps = 1e-7
             # Clip the edge
             Xn = X
-            #Xn = X_norm.clip(-1+eps, 1-eps).to_numpy()
             N, d = Xn.shape
 
             # density log t(x) = - 0.5 * sum_j log(1-x_j^2)
@@ -868,7 +832,6 @@ class sampling:
             log_p = np.zeros(N)
             for j in range(d):
                 counts, _ = np.histogram(Xn.to_numpy()[:, j], bins=edges)
-                #counts, _ = np.histogram(Xn[:, j], bins=edges)
                 dens = counts / (N * widths[0])
                 dens = np.maximum(dens, 1e-12) # floor
                 bj = np.clip(np.searchsorted(edges, Xn.to_numpy()[:, j], side='right') - 1, 0, n_bins - 1)
@@ -1030,7 +993,6 @@ class sampling:
                     state_vec_model_order = [float(df.loc[i, model_to_std[m]]) for m in model_state_names]
                     dstate = crn.toyEnzRHS(state_vec_model_order, t_val)
                     deriv.append(dstate)
-                #deriv_df = pd.DataFrame(deriv, columns=[f"d{m}/dt" for m in model_state_names])
                 deriv_df = pd.DataFrame(deriv, columns=[f"d{model_to_std[m]}/dt" for m in model_state_names])
                 df = pd.concat([df.reset_index(drop=True), deriv_df], axis=1)
                 return df
@@ -1038,7 +1000,7 @@ class sampling:
                 raise ValueError(f"Unsupported base model for derivative computation: {model_type}")
         else:
             raise ValueError("Either sbml_path or model_type must be provided to compute derivatives.")
-        # End of compute_derivatives
+        
     
 
 class distribution_test:
@@ -1216,6 +1178,185 @@ class distribution_test:
             'edges': edges_list,
             'expected_per_cell': float(E_cell),
             'observed_shape': counts.shape
+        }
+    
+    def ks_exponential_marginals(self, bounds=None, rate: float = 1.0):
+        """
+        One-sample K–S test for exponential marginals on each dimension.
+        This matches the Laguerre basis weight w(x)=exp(-x) on [0,+∞) (i.e., Exp(rate) with rate=1 by default).
+        We test against a *truncated* exponential on [a_eff, b] where:
+           a_eff = max(a, 0) to respect the exponential support; if bounds is None we use sample min/max.
+        The test uses the exact truncated CDF:
+           F_trunc(x) = (F(x) - F(a_eff)) / (F(b) - F(a_eff)),
+        where F(x) = 1 - exp(-rate * x) and F(b)=1 if b is infinite.
+
+        Returns
+        -------
+        results : list of dicts per dimension:
+            [{'dim': j, 'stat': D, 'pvalue': p, 'n': N_j, 'bounds': (a_eff, b), 'rate': rate}]
+        """
+        X = np.asarray(self.X)
+        assert X.ndim == 2, "X must be (N, d)"
+        N, d = X.shape
+        results = []
+
+        # bounds: if None, estimate from data
+        if bounds is None:
+            bounds = [(np.nanmin(X[:, j]), np.nanmax(X[:, j])) for j in range(d)]
+            estimated = True
+        else:
+            assert len(bounds) == d
+            estimated = False
+
+        for j in range(d):
+            xj = X[:, j]
+            xj = xj[np.isfinite(xj)]
+            n_j = len(xj)
+            if n_j == 0:
+                results.append({'dim': j, 'stat': np.nan, 'pvalue': np.nan, 'n': 0, 'bounds': None, 'rate': rate})
+                continue
+
+            a, b = bounds[j]
+            if not np.isfinite(a): a = 0.0
+            a_eff = max(float(a), 0.0)  # enforce exponential support
+            b_eff = float(b)
+            if not np.isfinite(b_eff):
+                Fb = 1.0
+            else:
+                if b_eff <= a_eff:
+                    raise ValueError(f"Bad bounds for dim {j}: U <= max(L,0): {(a, b)}")
+                Fb = 1.0 - np.exp(-rate * b_eff)
+
+            Fa = 1.0 - np.exp(-rate * a_eff)
+            denom = max(Fb - Fa, 1e-15)
+
+            def cdf_trunc(t):
+                t = np.asarray(t, dtype=float)
+                # below lower support -> 0; above upper bound -> 1
+                if np.isscalar(t):
+                    if t <= a_eff: return 0.0
+                    if np.isfinite(b_eff) and t >= b_eff: return 1.0
+                Ft = 1.0 - np.exp(-rate * t)
+                return (Ft - Fa) / denom
+
+            D, p = stats.kstest(xj, cdf_trunc)
+            results.append({
+                'dim': j,
+                'stat': float(D),
+                'pvalue': float(p),
+                'n': int(n_j),
+                'bounds': (float(a_eff), float(b_eff)),
+                'rate': float(rate),
+                'note': 'bounds estimated' if estimated else 'bounds provided'
+            })
+        return results
+
+    def energy_exponential_joint(self, bounds=None, rate: float = 1.0, n_ref=None, n_perm=199, random_state=0, max_pool=4000):
+        """
+        Multivariate joint test via Energy Distance for exponential target (product of independent exponentials).
+        Target per-dimension distribution: truncated Exp(rate) on [a_eff, b], where a_eff=max(a,0) and
+        b is the provided upper bound (can be +∞). This aligns with the Laguerre basis weight exp(-x).
+
+        Procedure:
+          - If bounds is None, use sample min/max per dim (p-values approximate).
+          - Simulate reference Y from the product of (truncated) Exp(rate) with inverse-CDF sampling.
+          - Compute energy statistic T and a permutation p-value.
+
+        Returns a dict:
+          {'stat': T, 'pvalue': p, 'n': n_used, 'm': m_used, 'bounds': bounds_used, 'rate': rate, 'note': str}
+        """
+        rng = np.random.default_rng(random_state)
+        X = np.asarray(self.X)
+        assert X.ndim == 2, "X must be (N, d)"
+        n, d = X.shape
+
+        # bounds
+        if bounds is None:
+            bounds_used = [(np.nanmin(X[:, j]), np.nanmax(X[:, j])) for j in range(d)]
+            note_bounds = 'bounds estimated from sample'
+        else:
+            assert len(bounds) == d, "bounds length must equal d"
+            bounds_used = bounds
+            note_bounds = 'bounds provided'
+
+        # helper: sample from truncated Exp(rate) on [a_eff, b]
+        def sample_trunc_exp(size):
+            Z = np.empty((size, d), dtype=float)
+            for j in range(d):
+                a, b = bounds_used[j]
+                a_eff = max(float(a), 0.0)
+                Fa = 1.0 - np.exp(-rate * a_eff)
+                if np.isfinite(b):
+                    Fb = 1.0 - np.exp(-rate * float(b))
+                else:
+                    Fb = 1.0
+                u = rng.random(size)
+                # target cdf in [Fa, Fb]: u' = Fa + u*(Fb-Fa)
+                u_prime = Fa + u * (Fb - Fa)
+                # inverse CDF for Exp(rate): x = -ln(1 - u')/rate
+                Z[:, j] = -np.log(np.maximum(1.0 - u_prime, 1e-15)) / rate
+            return Z
+
+        # reference sample size
+        m = int(n if n_ref is None else n_ref)
+        Y = sample_trunc_exp(m)
+
+        # Optionally subsample pooled size
+        pool_limit = int(max_pool)
+        if n + m > pool_limit:
+            frac = pool_limit / float(n + m)
+            n_new = max(100, int(np.round(n * frac)))
+            m_new = max(100, int(np.round(m * frac)))
+            idxX = rng.choice(n, size=n_new, replace=False)
+            idxY = rng.choice(m, size=m_new, replace=False)
+            X_use = X[idxX]
+            Y_use = Y[idxY]
+        else:
+            X_use = X
+            Y_use = Y
+            n_new = n
+            m_new = m
+
+        # pairwise distances
+        Zpool = np.vstack([X_use, Y_use])
+        Dmat = squareform(pdist(Zpool, metric='euclidean'))
+        n_total = n_new + m_new
+
+        def energy_T(idxA):
+            idxA = np.asarray(idxA, dtype=int)
+            maskA = np.zeros(n_total, dtype=bool)
+            maskA[idxA] = True
+            idxB = np.where(~maskA)[0]
+            DA = Dmat[np.ix_(idxA, idxA)]
+            DB = Dmat[np.ix_(idxB, idxB)]
+            DAB = Dmat[np.ix_(idxA, idxB)]
+            sum_AA = np.sum(np.triu(DA, k=1))
+            sum_BB = np.sum(np.triu(DB, k=1))
+            sum_AB = np.sum(DAB)
+            nA, nB = len(idxA), len(idxB)
+            term_AB = (2.0 / (nA * nB)) * sum_AB
+            term_AA = (2.0 / (nA * (nA - 1))) * sum_AA if nA > 1 else 0.0
+            term_BB = (2.0 / (nB * (nB - 1))) * sum_BB if nB > 1 else 0.0
+            Enm = term_AB - term_AA - term_BB
+            return (nA * nB / (nA + nB)) * Enm
+
+        idxA0 = np.arange(n_new)
+        T_obs = energy_T(idxA0)
+        Ts = np.empty(int(n_perm), dtype=float)
+        for r in range(int(n_perm)):
+            perm = rng.permutation(n_total)
+            idxA = perm[:n_new]
+            Ts[r] = energy_T(idxA)
+        pval = (1.0 + np.sum(Ts >= T_obs)) / (1.0 + len(Ts))
+
+        return {
+            'stat': float(T_obs),
+            'pvalue': float(pval),
+            'n': int(n_new),
+            'm': int(m_new),
+            'bounds': [(float(max(a,0.0)), float(b)) for (a,b) in bounds_used],
+            'rate': float(rate),
+            'note': f"{note_bounds}; permutations={int(n_perm)}; pooled={n_new+m_new}/{n+m}"
         }
     
     def ks_arcsine_marginals(self, bounds=None):
