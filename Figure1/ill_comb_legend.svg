@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="543.297187pt" height="67.68pt" viewBox="0 0 543.297187 67.68" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-02-02T17:54:29.942482</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.3, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 67.68 
+L 543.297188 67.68 
+L 543.297188 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="legend_1">
+    <g id="line2d_1">
+     <path d="M 7.44 32.729062 
+L 22.44 32.729062 
+L 37.44 32.729062 
+" style="fill: none; stroke: #9b85ad; stroke-width: 1.8; stroke-linecap: square"/>
+     <defs>
+      <path id="m1ee4d5ef11" d="M -3.5 3.5 
+L 3.5 3.5 
+L 3.5 -3.5 
+L -3.5 -3.5 
+z
+" style="stroke: #9b85ad; stroke-linejoin: miter"/>
+     </defs>
+     <g>
+      <use xlink:href="#m1ee4d5ef11" x="22.44" y="32.729062" style="fill: #9b85ad; stroke: #9b85ad; stroke-linejoin: miter"/>
+     </g>
+    </g>
+    <g id="text_1">
+     <text style="font-size: 15px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="49.44" y="37.979062" transform="rotate(-0 49.44 37.979062)">Monomial</text>
+    </g>
+    <g id="line2d_2">
+     <path d="M 144.882187 32.729062 
+L 159.882187 32.729062 
+L 174.882187 32.729062 
+" style="fill: none; stroke: #1f78b4; stroke-width: 1.8; stroke-linecap: square"/>
+     <defs>
+      <path id="mb77171b9da" d="M 0 3.5 
+C 0.928211 3.5 1.81853 3.131218 2.474874 2.474874 
+C 3.131218 1.81853 3.5 0.928211 3.5 0 
+C 3.5 -0.928211 3.131218 -1.81853 2.474874 -2.474874 
+C 1.81853 -3.131218 0.928211 -3.5 0 -3.5 
+C -0.928211 -3.5 -1.81853 -3.131218 -2.474874 -2.474874 
+C -3.131218 -1.81853 -3.5 -0.928211 -3.5 0 
+C -3.5 0.928211 -3.131218 1.81853 -2.474874 2.474874 
+C -1.81853 3.131218 -0.928211 3.5 0 3.5 
+z
+" style="stroke: #1f78b4"/>
+     </defs>
+     <g>
+      <use xlink:href="#mb77171b9da" x="159.882187" y="32.729062" style="fill: #1f78b4; stroke: #1f78b4"/>
+     </g>
+    </g>
+    <g id="text_2">
+     <text style="font-size: 15px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="186.882187" y="37.979062" transform="rotate(-0 186.882187 37.979062)">Legendre</text>
+    </g>
+    <g id="line2d_3">
+     <path d="M 279.547031 32.729062 
+L 294.547031 32.729062 
+L 309.547031 32.729062 
+" style="fill: none; stroke: #ff7f00; stroke-width: 1.8; stroke-linecap: square"/>
+     <defs>
+      <path id="m86d6cd7075" d="M 0 -3.5 
+L -3.5 3.5 
+L 3.5 3.5 
+z
+" style="stroke: #ff7f00; stroke-linejoin: miter"/>
+     </defs>
+     <g>
+      <use xlink:href="#m86d6cd7075" x="294.547031" y="32.729062" style="fill: #ff7f00; stroke: #ff7f00; stroke-linejoin: miter"/>
+     </g>
+    </g>
+    <g id="text_3">
+     <text style="font-size: 15px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="321.547031" y="37.979062" transform="rotate(-0 321.547031 37.979062)">Chebyshev</text>
+    </g>
+    <g id="line2d_4">
+     <path d="M 427.086094 32.729062 
+L 442.086094 32.729062 
+L 457.086094 32.729062 
+" style="fill: none; stroke: #33a02c; stroke-width: 1.8; stroke-linecap: square"/>
+     <defs>
+      <path id="m9a7566b212" d="M -0 4.949747 
+L 4.949747 0 
+L 0 -4.949747 
+L -4.949747 -0 
+z
+" style="stroke: #33a02c; stroke-linejoin: miter"/>
+     </defs>
+     <g>
+      <use xlink:href="#m9a7566b212" x="442.086094" y="32.729062" style="fill: #33a02c; stroke: #33a02c; stroke-linejoin: miter"/>
+     </g>
+    </g>
+    <g id="text_4">
+     <text style="font-size: 15px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start" x="469.086094" y="37.979062" transform="rotate(-0 469.086094 37.979062)">Laguerre</text>
+    </g>
+   </g>
+  </g>
+ </g>
+</svg>
