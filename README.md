@@ -13,6 +13,11 @@ The experiments in this repository are designed to support the following finding
 - Orthogonal polynomial libraries do not universally fix conditioning problems.
 - When sampling is aligned with the weighting assumptions of the orthogonal basis, conditioning and recovery can improve substantially.
 
+
+# Related packages
+- PySINDy
+- DAE-FINDER
+
 ## Repository structure
 
 This repository currently uses a lightweight script-and-notebook layout:
