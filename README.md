@@ -14,7 +14,20 @@ The experiments in this repository are designed to support the following finding
 - When sampling is aligned with the weighting assumptions of the orthogonal basis, conditioning and recovery can improve substantially.
 
 
-# Related packages
+## Code descriptions
+- Base_test.py - Define structures and simulations of baseline models.
+- Basis.py - Define monomial and orthogonal bases including Chebyshev, Legendre and Laguerre basis used as the candidate function library in PySINDy.
+- Collinearity.ipynb -
+- Comparison.py - Identify terms in original and recovered equations, compare wrong and missing terms, and compute the condition number of the matrix constructed with wrong and missing terms.
+- Definitions.py -
+- Distance_test.ipynb -
+- Functions.py -
+- Jensen_Shannon.py -
+- Models_exp.ipynb - Basic experiments for Beer model.
+- Multi.py - 
+
+
+## Related packages
 - PySINDy
 - DAE-FINDER
 
