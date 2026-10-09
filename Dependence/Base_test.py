@@ -76,7 +76,7 @@ class Lotka_Volterra:
             dxdt_vals = []
             dydt_vals = []
             for t, xn, yn in zip(sol.t, x_noisy, y_noisy):
-                dxdt, dydt = self.lv_rhs(t, [xn, yn])
+                dxdt, dydt = self.lv_rhs_1_1(t, [xn, yn])
                 dxdt_vals.append(dxdt)
                 dydt_vals.append(dydt)
 
@@ -208,8 +208,8 @@ class CRN:
             rng = np.random.default_rng(0)
             S_noisy = S_base + rng.normal(0,S_sigma)
             E_noisy = E_base + rng.normal(0,E_sigma)
-            ES_noisy = S_base + rng.normal(0,ES_sigma)
-            P_noisy = S_base + rng.normal(0,P_sigma)
+            ES_noisy = ES_base + rng.normal(0,ES_sigma)
+            P_noisy = P_base + rng.normal(0,P_sigma)
 
             # Computer derivatives
             dS_dt = []

@@ -653,8 +653,6 @@ class sampling:
                     df.loc[:, state_cols] = df[state_cols] + rng.normal(0.0, sigma)
                     # Optional: smooth noisy states with Savitzky–Golay filter
                     df = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
-                else:
-                    df_derive = df.copy()
 
                 if method in ('Laguerre','Monomial'):
                     X = df[state_cols].to_numpy()
@@ -726,11 +724,9 @@ class sampling:
                     df.loc[:, state_cols] = df[state_cols] + rng.normal(0.0, sigma)
                     # Optional: smooth noisy states with Savitzky–Golay filter
                     df = _savgol_smooth_columns(df, state_cols, window_length=7, polyorder=3, mode='interp')
-                else:
-                    df_deriv = df.copy()
 
                 if method in ('Laguerre','Monomial'):
-                    X = df_deriv[state_cols].to_numpy()
+                    X = df[state_cols].to_numpy()
                     Xdot = cfd(X,t)
 
                     for j,s in enumerate(state_cols):

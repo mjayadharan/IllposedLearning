@@ -34,6 +34,19 @@ The results for benchmark models are shown in Fig.3. The condition numbers of th
 - PySINDy
 - DAE-FINDER
 
+## Environment setup
+
+`environment.yml` defines a conda environment (`illposed`) that installs on Windows, macOS (Intel and Apple Silicon) and Linux:
+
+```bash
+conda env create -f environment.yml
+conda activate illposed
+```
+
+Key pins: pysindy 1.7.5 (the code uses the pre-2.0 API), numpy 1.26 and setuptools < 81 (required by pysindy 1.7.5), libroadrunner 2.7.0 (last release for numpy 1.26), and OpenBLAS. The comments in `environment.yml` explain each one.
+
+The modules in `Dependence/` import each other by name, so run scripts and notebooks with `Dependence/` as the working directory or on `PYTHONPATH`.
+
 ## Repository structure
 
 This repository currently uses a lightweight script-and-notebook layout:
@@ -42,6 +55,7 @@ This repository currently uses a lightweight script-and-notebook layout:
 .
 ├── README.md
 ├── .gitignore
+├── environment.yml
 ├── Basis.py
 ├── Comparison.py
 ├── PolyConvert.py
