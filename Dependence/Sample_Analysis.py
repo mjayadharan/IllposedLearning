@@ -240,6 +240,8 @@ class create_initial_conditions:
             self.sample_orig, self.sample_norm = self._exponential_sample()
         elif self.distribution.lower() == 'gaussian':
             self.sample_orig, self.sample_norm = self._gaussian_sample()
+        else:
+            raise ValueError(f"Unknown distribution: {self.distribution}")
 
     def _uniformly_sample(self):
             self.L_orig, self.U_orig = self.data_states.min(), self.data_states.max()
