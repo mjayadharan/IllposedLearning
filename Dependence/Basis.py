@@ -571,20 +571,3 @@ def n_features(
     n_in_feat, degree, include_interaction, interaction_only, include_bias
     ))
     return len(combinations)
-
-
-def IdentityChebyshevLibrary():
-    """
-    Generate an identity library using Chebyshev polynomials which maps all 
-    input features to themselves. This is equivalent to T_1(x_i) for each feature.
-    """
-    return OrthogonalLibrary(degree=1, method='Chebyshev',include_bias=False)
-
-def IdentityLegendreLibrary():
-    return OrthogonalLibrary(degree=1, method='Legendre',include_bias=False)
-
-def IdentityLaguerreLibrary():
-    return OrthogonalLibrary(degree=1, method='Laguerre', include_bias=False)
-
-def IdentityHermiteLibrary():
-    return OrthogonalLibrary(degree=1, method='Hermite', include_bias=False)

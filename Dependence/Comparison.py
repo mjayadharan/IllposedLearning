@@ -7,6 +7,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error
 from scipy.interpolate import UnivariateSpline
+from scipy.signal import savgol_filter
 
 from dae_finder import PolyFeatureMatrix,sequentialThLin
 import pysindy as ps
@@ -54,6 +55,77 @@ def target_relationship(data,target_col,test_size=0.2,fit_with_intercept=False):
     }   
     return result
 
+def sg_smooth_and_cdiff(
+    data_original: pd.DataFrame,
+    window_length: int = 11,   # Must be an odd number and ≤ the number of data points.
+    polyorder: int = 3,        # The degree of the polynomial must be less than the window length.
+    interpolate_nan: bool = True  # whether to first perform linear interpolation on each column to handle missing values
+):
+    """
+    Input:
+        data_original: DataFrame，
+        Column 1 represents time, with subsequent columns indicating status variables.
+    Output:
+        data_smoothed: DataFrame，Smoothed data (time + various states)
+        data_deriv:    DataFrame，First-order derivative data (time + derivatives for each state, column names suffixed with _d1)
+    """
+    if data_original.shape[1] < 2:
+        raise ValueError("The data frame must contain at least one column for time and one column for status.")
+
+    # --- Break down time and status ---
+    time_col = data_original.columns[0]
+    state_cols = list(data_original.columns[1:])
+    t = data_original[time_col].to_numpy(dtype=float)
+
+    n = len(data_original)
+    if n < 3:
+        raise ValueError("There are too few data points (<3) to perform smoothing/differentiation.")
+
+    # --- Correct SG parameters ---
+    # window_length must be an odd number and ≤ n
+    if window_length > n:
+        window_length = n if n % 2 == 1 else n - 1
+    if window_length < 3:
+        window_length = 3
+    if window_length % 2 == 0:
+        window_length -= 1
+    # polyorder should < window_length
+    if polyorder >= window_length:
+        polyorder = window_length - 1
+    if polyorder < 1:
+        polyorder = 1
+
+    # --- Copy the time column to two output boxes  ---
+    data_smoothed = pd.DataFrame({time_col: t})
+    data_deriv    = pd.DataFrame({time_col: t})
+
+    # --- Process each state column ---
+    for c in state_cols:
+        y = data_original[c].to_numpy(dtype=float)
+
+        # Handling Missing Values (Optional)
+        if interpolate_nan:
+            y = pd.Series(y).interpolate(
+                method='linear',
+                limit_direction='both'
+            ).to_numpy(dtype=float)
+
+        # 1) SG Smoothing (only when deriv=0)
+        y_smooth = savgol_filter(
+            y, window_length=window_length, polyorder=polyorder,
+            deriv=0, mode='interp'
+        )
+
+        # 2) Second-order central finite difference (second-order at interior points, 
+        # first-order at boundaries)
+        # np.gradient 
+        # Supports inputting uneven t values and automatically calculates differences based on coordinates.
+        y_d1 = np.gradient(y_smooth, t)
+
+        data_smoothed[c]     = y_smooth
+        data_deriv[f"{c}_d1"] = y_d1
+
+    return data_smoothed, data_deriv
 
 class TimeSeriesDerivative:
     """
@@ -171,8 +243,6 @@ class Noise_Free_results:
             )
             # Always pass input_feature_names=self.data.columns to preserve order/names
             library.fit(self.data_norm)
-            #candidate_lib = library.transform_to_dataframe(self.data_states, 
-                                                           #input_feature_names=self.data_states.columns)
             candidate_lib = library.transform_to_dataframe(self.data_norm, 
                                                            input_feature_names=self.data_norm.columns)   
         elif self.method == 'Legendre':
@@ -185,8 +255,7 @@ class Noise_Free_results:
             library.fit(self.data_norm)
             candidate_lib = library.transform_to_dataframe(self.data_norm, 
                                                            input_feature_names=self.data_norm.columns)
-            #candidate_lib = library.transform_to_dataframe(self.data_states, 
-                                                           #input_feature_names=self.data_states.columns)
+
         elif self.method == 'Laguerre':
             library = OrthogonalLibrary(
                 degree=degree,
@@ -195,8 +264,6 @@ class Noise_Free_results:
                 include_interaction=include_interaction_flag
             )
             library.fit(self.data_norm)
-            #candidate_lib = library.transform_to_dataframe(self.data_norm, 
-                                                           #input_feature_names=self.data_norm.columns)
             candidate_lib = library.transform_to_dataframe(self.data_states, 
                                                            input_feature_names=self.data_states.columns)
         return candidate_lib
@@ -207,12 +274,8 @@ class Noise_Free_results:
         num_library_terms = len(candidate_lib.columns)
         # Number of combinations
         num_combinations = n_choose_k(num_library_terms, comb)
-        #SVD_analyzer = SVD_analysis(candidate_lib,comb)
         #Regression_analyzer = Regression_analysis(data=candidate_lib,comb=comb,threshold=0.95)
         Regression_analyzer = Regression_analysis_advanced(data=candidate_lib,comb=comb,gpu_topk=None,threshold=0.00)
-        #comb_processed,comb_original = create_combinations_with_stable_svd(candidate_lib,comb)
-        #filtered,_ = filter_combinations_cond(comb_processed,comb_original,threshold=20)
-        #filtered = Regression_analyzer.filtered_result
         filtered = Regression_analyzer.filter_by_r2(0.95)
         # Number of ill-posed combinations with comb
         num_ill_comb = len(filtered)
@@ -429,8 +492,6 @@ class Terms_Identification_original:
     
     def _extract_terms(self,equation):
         # Extract individual terms from an equation
-        #equation = equation.replace('·', '*')   
-        #equation = equation.replace('*', ' ')
         equation = equation.replace(' ','')
         # Expand the equation to prevent identifying (x+y) as a term
         expanded_equation = self._expand_brackets(equation)
@@ -742,17 +803,6 @@ class Terms_Identification_recovered:
                 result_parts.append(f"{var}^{power}")
         
         return ' '.join(result_parts)
-        factors = re.split(r'[\*/\s]+', term)
-        xi_factors = []
-        xi_vars = self.reverse_mapping.values()
-        for f in factors:
-            for xi in xi_vars:
-                for var in re.findall(r'x\d+\^?\d*', f):
-                    xi_factors.append(var)
-                #if f.startswith(xi):
-                    #xi_factors.append(f)
-                    #break
-        return '*'.join(sorted(xi_factors)) if xi_factors else ''
     
     def _convert_to_power_notation(self, term):
         """Convert x1*x1 to x1^2,keep x1*x2 as x1 x2"""
@@ -823,7 +873,6 @@ class Terms_Identification_recovered:
     
     def _extract_terms(self,equation):
         # Extract individual terms from an equation
-        #equation = equation.replace('·', '*')   
         equation = equation.replace('*', ' ')
         equation = equation.replace(' ','')
         # Insert a '*' between a numeric coefficient and a following xi variable
@@ -1008,19 +1057,6 @@ class Terms_Identification_recovered:
         if not vars_found:
             return ''
         return '*'.join(vars_found)
-        factors = term.split('*')
-        variable_factors = []
-        all_vars = set(self.reverse_mapping.keys())
-        for factor in factors:
-            factor = factor.strip()
-            contains_var = False
-            for var in all_vars:
-                if var in factor:
-                    contains_var = True
-                    break
-            if contains_var or '^' in factor or '**' in factor:
-                variable_factors.append(factor)
-        return '*'.join(variable_factors) if variable_factors else ''
     
     def _is_pure_constant(self, term: str) -> bool:
         #Return True if the term contains no system state variables (x1, x2, ...).
@@ -1126,11 +1162,6 @@ class Terms_Analysis:
             #discovered_terms = set(discovered_series.index.tolist())
             #wrong = disc_terms_xi - orig_terms_xi
             #missing = orig_terms_xi - disc_terms_xi
-            #print(f"\n=== {lhs_xi} ===")
-            #print("ORI :", sorted(orig_terms_xi,key=str))
-            #print("DIS :", sorted(discovered_terms,key=str))
-            #print("Missing :", sorted(missing,key=str))
-            #print("Wrong:", sorted(wrong,key=str))
             wrong_terms[lhs] = wrong
             missing_terms[lhs] = missing
             mixed_terms[lhs] = wrong | missing
@@ -1157,7 +1188,7 @@ class Terms_Analysis:
                     parts = t.strip().split()
                     parts_sorted = sorted(parts, key=_xi_index)
                     canon_terms.append(' '.join(parts_sorted))
-            data = preprocess_for_stable(self.data[canon_terms], 'standarize')[0]
+            data = preprocess_for_stable(self.data[canon_terms], 'standardize')[0]
             if data.shape[1] == 0 or data.shape[0] == 0:
                 deg_info = f"(degree={self.degree})" if getattr(self, "degree", None) is not None else "(degree=unknown)"
                 print(f"{feature} {deg_info}: no wrong terms or missing terms, skipping SVD.")

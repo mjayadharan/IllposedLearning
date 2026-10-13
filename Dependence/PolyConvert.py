@@ -256,11 +256,10 @@ class OrthogonalToPolynomialConverter:
             x_in_t = (2 * x_var - (lower_bound + upper_bound)) / (upper_bound - lower_bound)
             expanded_poly = sp.expand(std_poly.subs(t_var, x_in_t))
             
-            # 修正：正确提取系数的方法
+            # Way to extract coefficients
             poly_sp = expanded_poly.as_poly(x_var)
             if poly_sp is not None:
-                # 多项式形式
-                all_coeffs = poly_sp.all_coeffs()  # 从最高次到常数项的系数列表
+                all_coeffs = poly_sp.all_coeffs()  # from the highest-degree term to constant
                 degree_poly = poly_sp.degree()
                 for i, coeff in enumerate(all_coeffs):
                     power = degree_poly - i
@@ -355,48 +354,6 @@ class OrthogonalToPolynomialConverter:
             basis_terms.append((variable, int(degree_str)))
         
         return coefficient, basis_terms
-    #def _parse_orthogonal_term(self, term_str) -> Tuple[float, List[Tuple[str, int]]]:
-        """
-        Parse a term like `alpha T_1(x3) T_2(x1)` (Chebyshev) or `alpha P_1(x3) P_2(x1)` (Legendre).
-        Returns (coefficient, [(variable, degree), ...])
-        """
-        if isinstance(term_str, list):
-            term_str = ' '.join(str(item) for item in term_str)
-        if not isinstance(term_str, str):
-            term_str = str(term_str)
-        term_str = term_str.strip()
-
-        symbol = 'T_' if self.basis == 'Chebyshev' else 'P_'
-        t_match = re.search(symbol, term_str)
-        if t_match:
-            coeff_str = term_str[:t_match.start()].strip()
-            basis_part = term_str[t_match.start():].strip()
-        else:
-            # No basis functions present -> constant term
-            try:
-                coeff = float(term_str)
-                return coeff, []
-            except ValueError:
-                raise ValueError(f"Cannot parse term: {term_str}")
-
-        # coefficient
-        if coeff_str in ('', '+'):
-            coefficient = 1.0
-        elif coeff_str == '-':
-            coefficient = -1.0
-        else:
-            try:
-                coefficient = float(coeff_str)
-            except ValueError:
-                raise ValueError(f"Invalid coefficient: {coeff_str}")
-
-        # basis function occurrences
-        pattern = r'T_(\d+)\(([^)]+)\)' if self.basis == 'Chebyshev' else r'P_(\d+)\(([^)]+)\)'
-        matches = re.findall(pattern, basis_part)
-        cheb_terms: List[Tuple[str, int]] = []
-        for degree_str, variable in matches:
-            cheb_terms.append((variable, int(degree_str)))
-        return coefficient, cheb_terms
     
     def _convert_basis_term_to_polynomial(self,
                                       coefficient: float,

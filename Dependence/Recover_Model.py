@@ -7,7 +7,6 @@ from matplotlib.ticker import LogFormatterExponent
 from sympy import symbols, expand, sympify, Poly, collect, simplify
 from scipy.linalg import lstsq
 import sympy as sp
-
 from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
 
 from dae_finder import sequentialThLin
@@ -76,103 +75,9 @@ class Recover_Model_dae:
                         'Equation':rhs.strip()})
         return pd.DataFrame(rows)
 
-class WhitenedOptimizer:
-    """
-    A thin wrapper for performing “empirical whitening” on incoming PySINDy optimizers:
-      1) Scale only (no centering): s_j = sqrt(mean(Theta[:,j]^2))   # RMS per column
-      2) G = (Theta_s^T Theta_s) / n,  W = G^{-1/2} (eigh)
-      3) Theta_ortho = Theta_s @ W
-      4) Call the underlying optimizer on Theta_ortho to obtain a_hat.
-      5) Projection back to the original space: c = (W @ a_hat) / s
-    """
-    def __init__(self, base_optimizer, eps: float = 1e-12):
-        self.base = base_optimizer
-        self.eps = eps
-        self.coef_ = None  # Post-return assignment
-
-    def _compute_whitener(self, Theta):
-        n, p = Theta.shape
-        # Scaling only (RMS), without mean subtraction, to avoid affecting the constant column.
-        s = np.sqrt(np.mean(Theta ** 2, axis=0))
-        s[s < self.eps] = 1.0
-        Theta_s = Theta / s
-        # Experience Gram
-        G = (Theta_s.T @ Theta_s) / max(n, 1)
-        G = G + self.eps * np.eye(p)
-        w, V = np.linalg.eigh(G)
-        w[w < self.eps] = self.eps
-        W = V @ np.diag(1.0 / np.sqrt(w)) @ V.T
-        return Theta_s, s, W
-
-    def fit(self, Theta, y):
-        Theta_s, s, W = self._compute_whitener(Theta)
-        Theta_ortho = Theta_s @ W
-        fitted = self.base.fit(Theta_ortho, y)
-
-        # Pull coefficients from the wrapped optimizer (before mapping back)
-        coef_hat = getattr(self.base, "coef_", None)
-        if coef_hat is None:
-            coef_hat = getattr(fitted, "coef_", None)
-        if coef_hat is None:
-            raise RuntimeError("Wrapped optimizer did not expose 'coef_' after fit().")
-
-        coef_hat = np.asarray(coef_hat)
-        p = Theta.shape[1]
-
-        # Record the original layout to restore afterwards
-        orig_ndim = coef_hat.ndim
-        orig_shape = coef_hat.shape
-        # Determine (p, m) canonical form
-        if orig_ndim == 1:
-            # Expect (p,)
-            if coef_hat.shape[0] != p:
-                raise ValueError(
-                    f"coef_ length {coef_hat.shape[0]} does not match n_features {p}."
-                )
-            C0 = coef_hat.reshape(p, 1)
-            restore = ("vector", None)  # restore as 1D
-        elif orig_ndim == 2:
-            if coef_hat.shape[0] == p:
-                # (p, m)
-                C0 = coef_hat
-                restore = ("pm", orig_shape)
-            elif coef_hat.shape[1] == p:
-                # (m, p) -> transpose to (p, m)
-                C0 = coef_hat.T
-                restore = ("mp", orig_shape)
-            else:
-                raise ValueError(
-                    f"coef_ has incompatible shape {orig_shape}; expected one dimension equal to p={p}."
-                )
-        else:
-            raise ValueError(f"coef_ has unsupported ndim={orig_ndim}.")
-
-        # Map back to original feature space in canonical (p, m)
-        C_s = W @ C0              # (p, p) @ (p, m) -> (p, m)
-        C = C_s / s[:, None]      # row-wise scale back
-
-        # Restore to the original layout expected by the base optimizer / PySINDy
-        kind, meta = restore
-        if kind == "vector":
-            self.coef_ = C[:, 0]                  # (p,)
-        elif kind == "pm":
-            self.coef_ = C                        # (p, m)
-        elif kind == "mp":
-            self.coef_ = C.T                      # (m, p)
-        else:
-            # Fallback: keep canonical (p, m)
-            self.coef_ = C
-
-        return self
-
-    # Other properties/methods of the transparent underlying optimizer (such as threshold, max_iter, etc.)
-    def __getattr__(self, name):
-        if name in ("base", "eps", "coef_"):    
-            return super().__getattribute__(name)
-        return getattr(self.base, name)
     
 class Recover_Model_sindy:
-    def __init__(self,data,differential_order,poly_degree,threshold,method,
+    def __init__(self,data,differential_order,poly_degree,method,threshold=0.1,alpha=None,
                  threshold_scan=None,Xdot=None,debug=True,after_threshold=None,
                  L=None, U=None,denormalize=True):
         # data: DataFrame -- contains all columns including states and time
@@ -183,6 +88,7 @@ class Recover_Model_sindy:
         self.differential_order = differential_order
         self.poly_degree = poly_degree
         self.threshold = threshold
+        self.alpha = alpha
         self.threshold_scan = threshold_scan
         self.Xdot = Xdot
         self.method = method
@@ -203,151 +109,6 @@ class Recover_Model_sindy:
             self.model_expression = self._recovered_model_monomial()
         else:
             self.model_expression = self._recovered_model_orthogonal()
-
-    def _remap_legendre_linear_names_by_corr(self, eq_list):
-        """Return a new eq_list where *single* linear Legendre tags P_1(xi) are renamed
-        to the variable whose raw state column correlates the most with that library column.
-        Products like 'P_1(xi) P_1(xj)' are left untouched.
-        This is purely data-driven and does not inject model priors.
-        """
-        if self.method != 'Chebyshev':
-            return eq_list
-        mdl = getattr(self, 'model', None)
-        if mdl is None:
-            return eq_list
-        lib = mdl.feature_library
-        X = np.asarray(self.data_states, dtype=float)
-        try:
-            Theta = lib.transform(X)
-        except Exception:
-            Theta = lib.transform([X])[0]
-        try:
-            names = lib.get_feature_names(input_features=self.features)
-        except Exception:
-            names = lib.get_feature_names()
-
-        # Identify linear Legendre columns by name pattern
-        lin_idx = []
-        lin_name = []
-        for j, nm in enumerate(names):
-            if re.fullmatch(r"P_1\(x\w+\)", nm) or re.fullmatch(r"P1\(x\w+\)", nm):
-                lin_idx.append(j)
-                lin_name.append(nm)
-        if not lin_idx:
-            return eq_list
-
-        # Build name -> canonical tag mapping by max |corr| with raw state columns
-        Xarr = np.asarray(X, float)
-        mapping = {}
-        for j, nm in zip(lin_idx, lin_name):
-            corrs = [abs(np.corrcoef(Theta[:, j], Xarr[:, k])[0, 1]) for k in range(Xarr.shape[1])]
-            k_best = int(np.argmax(corrs))
-            mapping[nm] = f"P_1({self.features[k_best]})"
-        if self.debug:
-            print("[REMAP] linear Legendre tags:")
-            for k in mapping:
-                print(f"  {k} -> {mapping[k]}")
-
-        # Replace only tokens that contain exactly one P_1(...) tag (singletons),
-        # leaving product terms intact
-        def remap_rhs(rhs: str) -> str:
-            # split into signed terms while preserving signs
-            parts = re.findall(r"[+-]?\s*[^+-]+", rhs)
-            new_parts = []
-            for term in parts:
-                tags = re.findall(r"P_1\(x\w+\)|P1\(x\w+\)", term)
-                if len(tags) == 1:
-                    t_old = tags[0]
-                    t_new = mapping.get(t_old, t_old)
-                    new_parts.append(term.replace(t_old, t_new))
-                else:
-                    new_parts.append(term)
-            # rejoin and normalize spaces/signs
-            out = " ".join(p.strip() for p in new_parts).strip()
-            out = re.sub(r"\+\s+-", "- ", out)
-            out = re.sub(r"\s+", " ", out)
-            return out
-
-        return [remap_rhs(rhs) for rhs in eq_list]
-
-    def _diagnose_linear_alignment(self):
-        """Call immediately after fitting is complete:
-        - Verify that the order of self.features matches that of self.model.feature_names_.
-        - Construct the library matrix Theta with feature names;
-        - For each state equation, print the projection <phi_j, y> 
-            of that state onto all “linear bases” (xj or P1(xj)).
-          And the values of the final coefficient matrix Xi on these columns, 
-          facilitating the identification of whether x2/x3 is misplaced.
-        """
-        try:
-            mdl = self.model
-        except Exception:
-            print("[DIAG] model not set; skip.")
-            return
-
-        # 1) Name and Sequence Alignment Check
-        model_names = list(getattr(mdl, 'feature_names_', self.features))
-        if model_names != self.features:
-            print("[DIAG][WARN] self.features and model.feature_names_ Sequence inconsistency:\n\tself.features=", self.features, "\n\tmodel.feature_names_=", model_names)
-        else:
-            print("[DIAG] feature name order OK ✓")
-
-        # 2) Constructing the library matrix and feature names 
-        # (compatible with OrthogonalLibrary's list-of-trajectories API)
-        lib = mdl.feature_library
-        X = np.asarray(self.data_states, dtype=float)
-        try:
-            Theta = lib.transform(X)
-        except Exception:
-            Theta = lib.transform([X])[0]
-        try:
-            lib_names = lib.get_feature_names(input_features=self.features)
-        except Exception:
-            lib_names = lib.get_feature_names()
-        Xi = np.asarray(mdl.coefficients())  # shape (n_features, n_states)
-
-        # 3) Identify the column index for the “linear term”（monomial: xj; Legendre: P1(xj)/P_1(xj)）
-        def linear_idx_for(var):
-            # Exact match for monomial name
-            if var in lib_names:
-                return lib_names.index(var)
-            # First-order basis matching Legendre
-            patts = [rf"P1\({re.escape(var)}\)", rf"P_1\({re.escape(var)}\)"]
-            for p in patts:
-                for k, nm in enumerate(lib_names):
-                    if re.fullmatch(p, nm):
-                        return k
-            return None
-
-        idx_linear = {v: linear_idx_for(v) for v in self.features}
-        print("[DIAG] linear feature indices:", idx_linear)
-
-        # 4) For each equation, print: <phi_lin, y> and Xi[lin, j]
-        if self.Xdot is None:
-            t = np.asarray(self.time, dtype=float).reshape(-1)
-            Ydot = np.gradient(np.asarray(self.data_states, dtype=float), t, axis=0, edge_order=self.differential_order)
-        else:
-            Ydot = np.asarray(self.Xdot, dtype=float)
-
-        for j, var in enumerate(self.features):
-            y = Ydot[:, j]
-            print(f"\n[DIAG] Equation for d{var}/dt")
-            # List the projections and coefficients of linear terms in variable order.
-            rows = []
-            for v in self.features:
-                idx = idx_linear.get(v)
-                if idx is None:
-                    rows.append((v, None, None))
-                    continue
-                proj = float(Theta[:, idx].T @ y)
-                coef = float(Xi[idx, j]) if idx < Xi.shape[0] else np.nan
-                rows.append((v, proj, coef))
-            # Print
-            print("      var       <phi, y>         coef")
-            for v, pr, cf in rows:
-                pr_s = f"{pr: .6e}" if pr is not None else "   (NA)   "
-                cf_s = f"{cf: .6e}" if cf is not None else "   (NA)   "
-                print(f"    {v:>6s}   {pr_s:>14s}   {cf_s:>14s}")
 
     def _preprocess(self):
         data, time_col = standardize_columns(self.data)
@@ -479,7 +240,10 @@ class Recover_Model_sindy:
     def _recovered_model_monomial(self):
         #differential_method = ps.FiniteDifference(self.differential_order)
         feature_library = ps.PolynomialLibrary(self.poly_degree,include_bias=False)
-        optimizer = ps.STLSQ(threshold=self.threshold)
+        if self.alpha is None:
+            optimizer = ps.STLSQ(threshold=self.threshold)
+        else:
+            optimizer = ps.STLSQ(threshold=self.threshold,alpha=self.alpha)
         feature_names = self.features
         
         if self.Xdot is None:
@@ -493,10 +257,6 @@ class Recover_Model_sindy:
             )
             self.model = model
             model.fit(self.data_states, t=self.time, x_dot=self.Xdot)
-            #model.fit(self.data_states,t = self.time)
-            #if getattr(self, 'debug', False):
-                #print("\n===== DIAG (monomial) =====")
-                #self._diagnose_linear_alignment()
         else:
             model = ps.SINDy(
                 feature_library=feature_library,
@@ -505,9 +265,6 @@ class Recover_Model_sindy:
             )
             self.model = model
             model.fit(self.data_states,t=self.time,x_dot=self.Xdot)
-        #if getattr(self, 'debug', False):
-            #print("\n===== DIAG (monomial) =====")
-            #self._diagnose_linear_alignment()
         eq_rhs = model.equations()
 
         # Setting for denormalized model (Compare with Legendre and Chebyshev)
@@ -538,8 +295,10 @@ class Recover_Model_sindy:
     def _recovered_model_orthogonal(self):
         feature_library = OrthogonalLibrary(degree=self.poly_degree, method=self.method,
                                             include_bias=True)
-        optimizer = ps.STLSQ(threshold=self.threshold)
-        #optimizer = WhitenedOptimizer(base_optimizer)
+        if self.alpha is None:
+            optimizer = ps.STLSQ(threshold=self.threshold)
+        else:
+            optimizer = ps.STLSQ(threshold=self.threshold,alpha=self.alpha)
         feature_names = self.features
 
         if self.Xdot is None:
@@ -552,9 +311,6 @@ class Recover_Model_sindy:
             )
             self.model = model
             model.fit(self.data_states, t=self.time)
-            #if getattr(self, 'debug', False):
-                #print("\n===== DIAG (orthogonal) =====")
-                #self._diagnose_linear_alignment()
         else:
             model = ps.SINDy(
                 feature_library=feature_library,
@@ -563,9 +319,6 @@ class Recover_Model_sindy:
             )
             self.model = model
             model.fit(self.data_states, t=self.time, x_dot=self.Xdot)
-            #if getattr(self, 'debug', False):
-                #print("\n===== DIAG (orthogonal) =====")
-                #self._diagnose_linear_alignment()
         eq_list = model.equations()
         print("len(eq_list)=", len(eq_list))
         # Step 1: orthogonal → monomial polynomial (no denormalization)
@@ -986,153 +739,12 @@ class Recover_Model_sindy:
             terms.append(current_term)
 
         return terms
-
-    def _plot_pareto(self):
-        """Compute Pareto-like curves of error vs threshold.
-        This version fits a fresh model for each threshold and computes scores immediately,
-        avoiding the fragile pattern of reusing a single optimizer/model afterward.
-        """
-        from sklearn.metrics import mean_squared_error as _mse
-
-        # Train/test split on index (no shuffle to preserve time ordering)
-        indices = np.arange(len(self.data_states))
-        train_indices, test_indices = train_test_split(
-            indices, test_size=0.33, random_state=27, shuffle=False
-        )
-
-        # Prepare data by basis type
-        method = self.method
-        feature_names = self.features
-        t = self.time
-        t_train = t[train_indices]
-        t_test = t[test_indices]
-
-        # Prepare X / Xdot on the appropriate space
-        if method == 'Monomial':
-            X_all = np.asarray(self.data_states, dtype=np.float64)
-            if self.Xdot is None:
-                Xdot_all = np.gradient(X_all, t, axis=0, edge_order=self.differential_order)
-            else:
-                Xdot_all = np.asarray(self.Xdot, dtype=np.float64)
-            X_train, X_test = X_all[train_indices], X_all[test_indices]
-            Xdot_train, Xdot_test = Xdot_all[train_indices], Xdot_all[test_indices]
-            feature_library = ps.PolynomialLibrary(self.poly_degree, include_bias=False)
-        elif method in ('Chebyshev', 'Legendre'):
-            # Use normalized data for orthogonal libraries
-            X_all = np.asarray(self.data_norm, dtype=np.float64)
-            # For fair scoring, compute derivative in the same normalized space
-            Xdot_all = np.gradient(X_all, t, axis=0, edge_order=self.differential_order)
-            X_train, X_test = X_all[train_indices], X_all[test_indices]
-            Xdot_train, Xdot_test = Xdot_all[train_indices], Xdot_all[test_indices]
-            feature_library = OrthogonalLibrary(degree=self.poly_degree, method=method)
-        else:
-            raise ValueError(f"Unknown method: {method}")
-
-        thresholds = self.threshold_scan if self.threshold_scan is not None else [self.threshold]
-        mse_deriv = np.zeros(len(thresholds))
-        mse_traj = np.zeros(len(thresholds))
-
-        for k, thr in enumerate(thresholds):
-            optimizer = ps.STLSQ(threshold=thr)
-            model = ps.SINDy(
-                feature_library=feature_library,
-                optimizer=optimizer,
-                feature_names=feature_names,
-            )
-            # Fit on training set
-            model.fit(X_train, t=t_train, x_dot=Xdot_train)
-
-            # 1) Derivative-domain error on test set
-            try:
-                mse_deriv[k] = model.score(X_test, t=t_test, x_dot=Xdot_test, metric=_mse)
-            except Exception:
-                # If score fails (shape mismatch, etc.), fall back to manual MSE
-                Xdot_pred = model.predict(X_test)
-                mse_deriv[k] = np.mean((Xdot_test - Xdot_pred) ** 2)
-
-            # 2) Trajectory-domain error on test set via simulate
-            try:
-                x0 = X_test[0]
-                X_sim = model.simulate(x0, t_test, integrator="odeint")
-                # If simulate explodes, clip to avoid NaNs in MSE
-                if np.any(~np.isfinite(X_sim)) or np.any(np.abs(X_sim) > 1e6):
-                    X_sim = np.clip(X_sim, -1e6, 1e6)
-                mse_traj[k] = np.mean((X_test - X_sim) ** 2)
-            except Exception:
-                mse_traj[k] = np.nan
-
-        # Plot (do not rely on external helper)
-        plt.figure()
-        plt.semilogy(thresholds, mse_deriv, "o-", label=r"$\dot{X}$ RMSE")
-        plt.xlabel(r"$\lambda$")
-        plt.xticks(thresholds, [f"{v:.1e}" for v in thresholds])
-        plt.ylabel(r"Error")
-        plt.title("Derivative-domain error vs threshold")
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-
-        plt.figure()
-        plt.semilogy(thresholds, mse_traj, "o-", label="Trajectory RMSE")
-        plt.xlabel(r"$\lambda$")
-        plt.ylabel("Error")
-        plt.xticks(thresholds, [f"{v:.1e}" for v in thresholds])
-        plt.title("Trajectory-domain error vs threshold")
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-
-        return thresholds, mse_deriv, mse_traj
     
-
-def plot_pareto(coefs, opt, model, threshold_scan, x_test, t_test):
-        #formatter = LogFormatterExponent(base=10)
-        mse = np.zeros(len(threshold_scan))
-        mse_sim = np.zeros(len(threshold_scan))
-        for i in range(len(threshold_scan)):
-            opt.coef_ = coefs[i]
-            mse[i] = model.score(x_test, t=t_test, metric=mean_squared_error)
-            x_test_sim = model.simulate(x_test.iloc[0].to_numpy(), t_test, integrator="odeint")
-            if np.any(x_test_sim > 1e4):
-                x_test_sim = 1e4
-            # Ensure subtraction is performed on compatible NumPy arrays and result is a scalar
-            mse_sim[i] = np.mean((x_test.values - x_test_sim) ** 2)
-        plt.figure()
-        plt.semilogy(threshold_scan, mse, "bo")
-        plt.semilogy(threshold_scan, mse, "b")
-        plt.ylabel(r"$\dot{X}$ RMSE", fontsize=20)
-        plt.xlabel(r"$\lambda$", fontsize=20)
-        plt.xticks(fontsize=14, rotation=45) 
-        plt.tight_layout() 
-        plt.yticks(fontsize=16)
-        plt.grid(True)
-        #plt.gca().xaxis.set_major_formatter(formatter)
-        plt.figure()
-
-        plt.semilogy(threshold_scan, mse_sim, "bo")
-        plt.semilogy(threshold_scan, mse_sim, "b")
-        plt.ylabel(r"$\dot{X}$ RMSE", fontsize=20)
-        plt.xlabel(r"$\lambda$", fontsize=20)
-        plt.xticks(ontsize=14, rotation=45) 
-        plt.tight_layout() 
-        plt.yticks(fontsize=16)
-        plt.grid(True)
-        #plt.gca().xaxis.set_major_formatter(formatter)
-
-
 
 class MonomialToLegendreConverter:
     """
     Converts SINDy-recovered ODEs from monomial basis to Legendre polynomial basis
     using the library definitions from Basis.py.
-    
-    Why generate libraries?
-    -----------------------
-    Even though SINDy already used libraries, we need to regenerate them here to:
-    1. Parse the monomial terms in SINDy's output equation
-    2. Build the mathematical mapping (conversion matrix) between bases
-    3. Solve the inverse problem: given monomial coefficients, find Legendre coefficients
-    
-    The libraries here should match your SINDy configuration exactly to ensure
-    consistency in the conversion.
     """
     
     def __init__(self, data, max_degree=3, normalize=False, include_bias=False):
