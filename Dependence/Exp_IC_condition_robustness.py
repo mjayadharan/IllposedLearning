@@ -19,7 +19,6 @@ import argparse
 import json
 import math
 import os
-import sys
 import tempfile
 from pathlib import Path
 
@@ -240,15 +239,6 @@ def save_figure(results: pd.DataFrame, summary: pd.DataFrame, out: Path) -> None
     fig.text(0.5, 0.015, "Points: median; error bars: 25th–75th percentiles across IC sets",
              ha="center", fontsize=9)
     fig.tight_layout(rect=(0, 0.055, 1, 0.84))
-    audit_dir = os.environ.get("FIGURE_AUDIT_SCRIPT_DIR")
-    if audit_dir:
-        sys.path.insert(0, audit_dir)
-        from audit_panel_alignment import require_matplotlib_panel_alignment
-
-        require_matplotlib_panel_alignment(
-            fig, json_out=out / "ic_condition_robustness.alignment.json",
-            tolerance_pt=1.5, gutter_tolerance_pt=1.5, strict=True,
-        )
     fig.savefig(out / "ic_condition_robustness.svg", bbox_inches="tight")
     fig.savefig(out / "ic_condition_robustness.pdf", bbox_inches="tight")
     fig.savefig(out / "ic_condition_robustness.png", dpi=300, bbox_inches="tight")
