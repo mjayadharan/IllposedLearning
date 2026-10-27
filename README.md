@@ -23,10 +23,24 @@ The experiments in this repository are designed to support the following finding
 - PolyConvert.py - Convert orthogonal polynomials to monomials and denormalize the recovered equations for the Legendre and Chebyshev bases.
 - Recover_Model.py - Recover models from data using monomial and orthogonal polynomial bases.
 - Sample_Analysis.py - Sample data according to specific distributions.
+- Exp_LV_remark3.py & Exp_CRN_remark3.py - Assess robustness to mismatch between the empirical sampling distribution and the target distribution by varying the number of initial conditions and trajectory length.
+- remark3_experiment.py - Supporting files for Exp_LV_remark3.py and Exp_CRN_remark3.py.
+- Exp_IC_condition_robustness.py - Assess the robustness of the results across different IC settings and their dependence on the sampling scheme.
+- Exp_library_scaling_comparison.py - Compare condition numbers between libraries with columns normalized to unit L2 norm and libraries at their original scale. (sampled data)
+- Exp_library_scaling_comparison_original_data.py - Compute the condition numbers of different polynomial libraries for the two baseline models. (original data)
+- Exp_original_raw_sensitivity.py - Perform a sensitivity analysis of SINDy model recovery with respect to the sparsity threshold and ridge penalty.
+- Exp_table1_lv_crn_l2.py - Compute the condition numbers reported in Tables SM1–SM4 of the supplementary material.
+- Exp_Plot3_condition.py - Compute the condition number of each benchmark model using scaled library.
 
+Figure 1 is generated primarily using Plots-1_modify.ipynb and Exp_library_scaling_comparison_original_data.py. The former generates panels (a)–(b) and (e)–(f), while the latter generates panels (c)–(d).
 Basis.py is used to generate Fig.1(c) and Fig.1(d); Comparison.py is used to generate Fig.1(e) and Fig.1(f).
 
-Sampling_Analysis.py is used to generate Fig.2(a)-(d); Basis.py is used for Fig.2(e)-(f); Sample_Analysis.py and Recover_Model.py are used for Fig.2(g)-(h).
+Figure 2 is generated using Exp_Plot3_condtion.py.
+
+Figure 3 is generated primarily using Plots_2.ipynb and Exp_library_scaling_comparison.py. The former generates panels (a)-(d) and (g)-(h), while the latter generates panels (e)-(f).
+
+Figure 4 is generated using Exp_LV_remark3.py & Exp_CRN_remark3.py. The former generates panels (a)-(d), while the latter generates panels (e)-(h).
+
 
 The results for benchmark models are shown in Fig.3. The condition numbers of the full library, as well as those of the incorrect and missing terms, are computed following the same procedure illustrated in Figs.1 and 2.
 
