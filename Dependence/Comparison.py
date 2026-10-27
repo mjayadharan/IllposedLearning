@@ -1188,7 +1188,7 @@ class Terms_Analysis:
                     parts = t.strip().split()
                     parts_sorted = sorted(parts, key=_xi_index)
                     canon_terms.append(' '.join(parts_sorted))
-            data = preprocess_for_stable(self.data[canon_terms], 'standarize')[0]
+            data = preprocess_for_stable(self.data[canon_terms], 'standardize')[0]
             if data.shape[1] == 0 or data.shape[0] == 0:
                 deg_info = f"(degree={self.degree})" if getattr(self, "degree", None) is not None else "(degree=unknown)"
                 print(f"{feature} {deg_info}: no wrong terms or missing terms, skipping SVD.")
