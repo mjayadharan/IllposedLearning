@@ -33,7 +33,6 @@ The experiments in this repository are designed to support the following finding
 - Exp_Plot3_condition.py - Compute the condition number of each benchmark model using scaled library.
 
 Figure 1 is generated primarily using Plots-1_modify.ipynb and Exp_library_scaling_comparison_original_data.py. The former generates panels (a)–(b) and (e)–(f), while the latter generates panels (c)–(d).
-Basis.py is used to generate Fig.1(c) and Fig.1(d); Comparison.py is used to generate Fig.1(e) and Fig.1(f).
 
 Figure 2 is generated using Exp_Plot3_condtion.py.
 
